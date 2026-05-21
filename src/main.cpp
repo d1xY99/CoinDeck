@@ -8,7 +8,6 @@
 
 #include "secrets.h"
 
-// --- Waveshare ESP32-S3-Touch-AMOLED-1.8 pinout (from Waveshare demo pin_config.h) ---
 #define LCD_SDIO0   4
 #define LCD_SDIO1   5
 #define LCD_SDIO2   6
@@ -30,11 +29,15 @@ Arduino_SH8601 *gfx = new Arduino_SH8601(
 
 static const uint16_t COL_BG    = RGB565_BLACK;
 static const uint16_t COL_TITLE = RGB565_WHITE;
-static const uint16_t COL_OK    = 0x07E0;
-static const uint16_t COL_WARN  = 0xFD20;
-static const uint16_t COL_ERR   = 0xF800;
-static const uint16_t COL_DIM   = 0x8410;
+static const uint16_t COL_OK    = RGB565(0,    255, 100);  // green
+static const uint16_t COL_ERR   = RGB565(255,  60,  60);   // red
+static const uint16_t COL_WARN  = RGB565(255,  165, 0);    // orange
+static const uint16_t COL_DIM   = RGB565(120,  120, 120);  // dim gray
+static const uint16_t COL_BTC   = RGB565(247,  147, 26);   // bitcoin orange
+static const uint16_t COL_ETH   = RGB565(132,  157, 235);  // ethereum violet-blue
+static const uint16_t COL_SOL   = RGB565(153,  69,  255);  // solana purple
 
+// --- State ---
 struct CoinSnapshot {
   float price_usd;
   float change_24h_pct;
@@ -42,11 +45,13 @@ struct CoinSnapshot {
 };
 static CoinSnapshot btc{}, eth{}, sol{};
 
-static const uint32_t FETCH_INTERVAL_MS = 30000;  // 30s — well under CoinGecko's free-tier rate limit
+static const uint32_t FETCH_INTERVAL_MS = 30000;
 static const uint32_t RETRY_INTERVAL_MS = 5000;
-static uint32_t next_fetch_at = 0;
-static uint32_t fetch_count   = 0;
-static uint32_t fetch_failed  = 0;
+static uint32_t next_fetch_at  = 0;
+static uint32_t last_fetch_ok  = 0;       // millis() of last successful fetch
+static uint32_t fetch_count    = 0;
+static uint32_t fetch_failed   = 0;
+static bool     grid_ready     = false;   // is the coin grid currently on screen?
 
 static const char *COINGECKO_URL =
     "https://api.coingecko.com/api/v3/simple/price"
@@ -70,27 +75,132 @@ static bool expander_reset_sequence() {
   return true;
 }
 
+static void format_money(char *out, size_t cap, float v) {
+  unsigned long ip = (unsigned long)v;
+  unsigned int  fp = (unsigned int)((v - ip) * 100.0f + 0.5f);
+  if (fp == 100) { ip++; fp = 0; }
+  if (v < 100.0f) {
+    snprintf(out, cap, "$%lu.%02u", ip, fp);
+  } else if (v < 10000.0f) {
+    snprintf(out, cap, "$%lu,%03lu.%02u", ip / 1000, ip % 1000, fp);
+  } else if (v < 1000000.0f) {
+    snprintf(out, cap, "$%lu,%03lu", ip / 1000, ip % 1000);
+  } else {
+    snprintf(out, cap, "$%lu,%03lu,%03lu",
+             ip / 1000000UL, (ip / 1000UL) % 1000UL, ip % 1000UL);
+  }
+}
+
+static void format_pct(char *out, size_t cap, float pct) {
+  snprintf(out, cap, "%+.2f%%", pct);
+}
+
+static int16_t text_width(const char *s, uint8_t size) {
+  return (int16_t)(strlen(s) * 6 * size);
+}
+
+// --- Drawing primitives ---
 static void draw_header() {
   gfx->setTextSize(4);
   gfx->setTextColor(COL_TITLE);
-  gfx->setCursor(88, 32);
+  int16_t w = text_width("CoinDeck", 4);
+  gfx->setCursor((LCD_WIDTH - w) / 2, 32);
   gfx->print("CoinDeck");
 
   gfx->setTextSize(1);
   gfx->setTextColor(COL_DIM);
-  gfx->setCursor(116, 76);
-  gfx->print("crypto desk ticker");
+  const char *sub = "crypto desk ticker";
+  w = text_width(sub, 1);
+  gfx->setCursor((LCD_WIDTH - w) / 2, 76);
+  gfx->print(sub);
 }
 
 static void status_line(int y, uint16_t color, const char *text) {
   gfx->fillRect(0, y, LCD_WIDTH, 24, COL_BG);
   gfx->setTextSize(2);
   gfx->setTextColor(color);
-  int16_t w = strlen(text) * 12;
+  int16_t w = text_width(text, 2);
   gfx->setCursor((LCD_WIDTH - w) / 2, y + 4);
   gfx->print(text);
 }
 
+// Layout:
+//   row top = base_y
+//   y+15..47:  ticker (left, color)  + price (right, white) — both at size 4
+//   y+55..71:  24h change at size 2, right-aligned, green/red
+static const int16_t MARGIN     = 16;
+static const int16_t ROW_HEIGHT = 90;
+static const int16_t BTC_Y      = 100;
+static const int16_t ETH_Y      = 200;
+static const int16_t SOL_Y      = 300;
+static const int16_t FOOTER_Y   = 410;
+
+static void draw_coin_row(int16_t y, const char *ticker, uint16_t ticker_color,
+                          const CoinSnapshot &c) {
+  // Clear the entire row first so old digits don't ghost when the price gets shorter.
+  gfx->fillRect(0, y, LCD_WIDTH, ROW_HEIGHT, COL_BG);
+
+  // Ticker on the left.
+  gfx->setTextSize(4);
+  gfx->setTextColor(ticker_color);
+  gfx->setCursor(MARGIN, y + 15);
+  gfx->print(ticker);
+
+  if (!c.valid) {
+    gfx->setTextSize(2);
+    gfx->setTextColor(COL_DIM);
+    const char *msg = "no data";
+    gfx->setCursor(LCD_WIDTH - MARGIN - text_width(msg, 2), y + 23);
+    gfx->print(msg);
+    return;
+  }
+
+  // Price on the right, white.
+  char price_buf[24];
+  format_money(price_buf, sizeof(price_buf), c.price_usd);
+  gfx->setTextSize(4);
+  gfx->setTextColor(COL_TITLE);
+  int16_t price_w = text_width(price_buf, 4);
+  gfx->setCursor(LCD_WIDTH - MARGIN - price_w, y + 15);
+  gfx->print(price_buf);
+
+  // 24h percent change, right-aligned below the price.
+  char pct_buf[16];
+  format_pct(pct_buf, sizeof(pct_buf), c.change_24h_pct);
+  gfx->setTextSize(2);
+  gfx->setTextColor(c.change_24h_pct >= 0 ? COL_OK : COL_ERR);
+  int16_t pct_w = text_width(pct_buf, 2);
+  gfx->setCursor(LCD_WIDTH - MARGIN - pct_w, y + 55);
+  gfx->print(pct_buf);
+}
+
+static void draw_footer() {
+  gfx->fillRect(0, FOOTER_Y, LCD_WIDTH, 20, COL_BG);
+
+  char buf[40];
+  if (last_fetch_ok == 0) {
+    snprintf(buf, sizeof(buf), "fetching...");
+  } else {
+    uint32_t age_s = (millis() - last_fetch_ok) / 1000;
+    snprintf(buf, sizeof(buf), "updated %lus ago", (unsigned long)age_s);
+  }
+  gfx->setTextSize(1);
+  gfx->setTextColor(COL_DIM);
+  gfx->setCursor((LCD_WIDTH - text_width(buf, 1)) / 2, FOOTER_Y + 4);
+  gfx->print(buf);
+}
+
+static void draw_grid() {
+  // Erase everything below the header in one shot.
+  gfx->fillRect(0, 90, LCD_WIDTH, LCD_HEIGHT - 90, COL_BG);
+  draw_coin_row(BTC_Y, "BTC", COL_BTC, btc);
+  draw_coin_row(ETH_Y, "ETH", COL_ETH, eth);
+  draw_coin_row(SOL_Y, "SOL", COL_SOL, sol);
+  draw_footer();
+  grid_ready = true;
+}
+
+// --- WiFi ---
 static bool wifi_connect(uint32_t timeout_ms = 20000) {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
@@ -112,7 +222,7 @@ static bool wifi_connect(uint32_t timeout_ms = 20000) {
   }
 
   status_line(200, COL_OK, "wifi OK");
-  char buf[32];
+  char buf[40];
   snprintf(buf, sizeof(buf), "IP %s", WiFi.localIP().toString().c_str());
   status_line(240, COL_DIM, buf);
   snprintf(buf, sizeof(buf), "RSSI %d dBm", (int)WiFi.RSSI());
@@ -122,20 +232,14 @@ static bool wifi_connect(uint32_t timeout_ms = 20000) {
   return true;
 }
 
+// --- CoinGecko fetch ---
 static bool fetch_prices() {
   if (WiFi.status() != WL_CONNECTED) return false;
 
   WiFiClientSecure client;
-  // CoinGecko's /simple/price is public read-only data. setInsecure() skips cert
-  // validation, which is fine here (no auth, no PII). We can pin the LE root CA
-  // later if we want belt-and-suspenders MITM protection.
-  client.setInsecure();
-
+  client.setInsecure();  // public price data, no auth — pin LE root CA later if we care
   HTTPClient http;
-  if (!http.begin(client, COINGECKO_URL)) {
-    Serial.println("http.begin failed");
-    return false;
-  }
+  if (!http.begin(client, COINGECKO_URL)) return false;
   http.setUserAgent("CoinDeck/0.1 (ESP32-S3)");
   http.setTimeout(8000);
 
@@ -145,7 +249,6 @@ static bool fetch_prices() {
     http.end();
     return false;
   }
-
   String body = http.getString();
   http.end();
 
@@ -171,7 +274,7 @@ void setup() {
   Serial.begin(115200);
   delay(2000);
   Serial.println();
-  Serial.println("=== CoinDeck step 4: CoinGecko fetch ===");
+  Serial.println("=== CoinDeck step 5: price grid ===");
 
   Wire.begin(IIC_SDA, IIC_SCL);
   Wire.setClock(400000);
@@ -193,7 +296,10 @@ void setup() {
 }
 
 void loop() {
+  static uint32_t last_footer_tick = 0;
+
   if (WiFi.status() != WL_CONNECTED) {
+    grid_ready = false;
     status_line(200, COL_WARN, "wifi lost, retry");
     wifi_connect();
   }
@@ -202,18 +308,26 @@ void loop() {
     bool ok = fetch_prices();
     fetch_count++;
     if (ok) {
-      char buf[32];
-      snprintf(buf, sizeof(buf), "fetch #%lu OK", (unsigned long)fetch_count);
-      status_line(320, COL_OK, buf);
+      last_fetch_ok = millis();
+      draw_grid();
       next_fetch_at = millis() + FETCH_INTERVAL_MS;
     } else {
       fetch_failed++;
-      char buf[32];
-      snprintf(buf, sizeof(buf), "fetch fail (%lu)", (unsigned long)fetch_failed);
-      status_line(320, COL_ERR, buf);
+      if (!grid_ready) {
+        status_line(320, COL_ERR, "fetch failed");
+      }
       next_fetch_at = millis() + RETRY_INTERVAL_MS;
     }
+    Serial.printf("[fetch %lu ok / %lu fail]\n",
+                  (unsigned long)(fetch_count - fetch_failed),
+                  (unsigned long)fetch_failed);
   }
 
-  delay(100);
+  // Refresh the "updated Xs ago" footer once per second so it actually counts up.
+  if (grid_ready && millis() - last_footer_tick > 1000) {
+    draw_footer();
+    last_footer_tick = millis();
+  }
+
+  delay(50);
 }
