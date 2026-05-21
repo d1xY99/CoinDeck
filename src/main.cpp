@@ -20,6 +20,8 @@
 #define IIC_SDA      15
 #define IIC_SCL      14
 #define XCA9554_ADDR 0x20
+#define FT3168_ADDR  0x38
+#define TP_INT       21
 
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
     LCD_CS, LCD_SCLK, LCD_SDIO0, LCD_SDIO1, LCD_SDIO2, LCD_SDIO3);
@@ -53,6 +55,10 @@ static uint32_t fetch_count    = 0;
 static uint32_t fetch_failed   = 0;
 static bool     grid_ready     = false;   // is the coin grid currently on screen?
 
+enum Screen { SCREEN_LIST, SCREEN_DETAIL };
+static Screen current_screen = SCREEN_LIST;
+static int    current_coin   = 0;   // 0=BTC, 1=ETH, 2=SOL — used by SCREEN_DETAIL
+
 static const char *COINGECKO_URL =
     "https://api.coingecko.com/api/v3/simple/price"
     "?ids=bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true";
@@ -72,6 +78,35 @@ static bool expander_reset_sequence() {
   delay(20);
   if (!xca_write(0x01, 0x07)) return false;
   delay(50);
+  return true;
+}
+
+// --- FT3168 touch ---
+static bool touch_begin() {
+  Wire.beginTransmission(FT3168_ADDR);
+  if (Wire.endTransmission() != 0) return false;
+  // Reg 0xA5 = power mode; 0x01 = monitor (low-power, wake on touch).
+  Wire.beginTransmission(FT3168_ADDR);
+  Wire.write(0xA5);
+  Wire.write(0x01);
+  Wire.endTransmission();
+  pinMode(TP_INT, INPUT_PULLUP);
+  return true;
+}
+
+static bool touch_read(int16_t &x, int16_t &y) {
+  Wire.beginTransmission(FT3168_ADDR);
+  Wire.write(0x02);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((int)FT3168_ADDR, 5) != 5) return false;
+  uint8_t fingers = Wire.read();
+  uint8_t xh = Wire.read();
+  uint8_t xl = Wire.read();
+  uint8_t yh = Wire.read();
+  uint8_t yl = Wire.read();
+  if (fingers == 0 || fingers > 5) return false;
+  x = ((xh & 0x0F) << 8) | xl;
+  y = ((yh & 0x0F) << 8) | yl;
   return true;
 }
 
@@ -200,6 +235,76 @@ static void draw_grid() {
   grid_ready = true;
 }
 
+static const char *coin_name(int idx) {
+  switch (idx) { case 0: return "BTC"; case 1: return "ETH"; case 2: return "SOL"; }
+  return "?";
+}
+static uint16_t coin_color(int idx) {
+  switch (idx) { case 0: return COL_BTC; case 1: return COL_ETH; case 2: return COL_SOL; }
+  return COL_DIM;
+}
+static const CoinSnapshot &coin_snap(int idx) {
+  switch (idx) { case 0: return btc; case 1: return eth; }
+  return sol;
+}
+
+static void draw_detail() {
+  gfx->fillRect(0, 90, LCD_WIDTH, LCD_HEIGHT - 90, COL_BG);
+
+  const char *name = coin_name(current_coin);
+  uint16_t color = coin_color(current_coin);
+  const CoinSnapshot &c = coin_snap(current_coin);
+
+  gfx->setTextSize(8);
+  gfx->setTextColor(color);
+  gfx->setCursor((LCD_WIDTH - text_width(name, 8)) / 2, 100);
+  gfx->print(name);
+
+  if (!c.valid) {
+    gfx->setTextSize(2);
+    gfx->setTextColor(COL_DIM);
+    const char *m = "no data yet";
+    gfx->setCursor((LCD_WIDTH - text_width(m, 2)) / 2, 220);
+    gfx->print(m);
+  } else {
+    char price_buf[24];
+    format_money(price_buf, sizeof(price_buf), c.price_usd);
+    gfx->setTextSize(5);
+    gfx->setTextColor(COL_TITLE);
+    gfx->setCursor((LCD_WIDTH - text_width(price_buf, 5)) / 2, 220);
+    gfx->print(price_buf);
+
+    char pct_buf[16];
+    format_pct(pct_buf, sizeof(pct_buf), c.change_24h_pct);
+    gfx->setTextSize(4);
+    gfx->setTextColor(c.change_24h_pct >= 0 ? COL_OK : COL_ERR);
+    gfx->setCursor((LCD_WIDTH - text_width(pct_buf, 4)) / 2, 300);
+    gfx->print(pct_buf);
+  }
+
+  gfx->setTextSize(1);
+  gfx->setTextColor(COL_DIM);
+  const char *hint = "tap = list   swipe < > = coin";
+  gfx->setCursor((LCD_WIDTH - text_width(hint, 1)) / 2, 410);
+  gfx->print(hint);
+}
+
+static void redraw_current_screen() {
+  if (current_screen == SCREEN_LIST) draw_grid();
+  else                                draw_detail();
+}
+
+static void goto_list() {
+  current_screen = SCREEN_LIST;
+  redraw_current_screen();
+}
+
+static void goto_detail(int coin_idx) {
+  current_coin = (coin_idx + 3) % 3;
+  current_screen = SCREEN_DETAIL;
+  redraw_current_screen();
+}
+
 // --- WiFi ---
 static bool wifi_connect(uint32_t timeout_ms = 20000) {
   WiFi.mode(WIFI_STA);
@@ -291,6 +396,12 @@ void setup() {
   gfx->fillScreen(COL_BG);
   for (int b = 0; b <= 255; b += 4) { gfx->setBrightness(b); delay(8); }
 
+  if (!touch_begin()) {
+    Serial.println("WARN: FT3168 not responding on I2C 0x38.");
+  } else {
+    Serial.println("FT3168 init OK");
+  }
+
   draw_header();
   wifi_connect();
 }
@@ -309,13 +420,11 @@ void loop() {
     fetch_count++;
     if (ok) {
       last_fetch_ok = millis();
-      draw_grid();
+      redraw_current_screen();
       next_fetch_at = millis() + FETCH_INTERVAL_MS;
     } else {
       fetch_failed++;
-      if (!grid_ready) {
-        status_line(320, COL_ERR, "fetch failed");
-      }
+      if (!grid_ready) status_line(320, COL_ERR, "fetch failed");
       next_fetch_at = millis() + RETRY_INTERVAL_MS;
     }
     Serial.printf("[fetch %lu ok / %lu fail]\n",
@@ -323,11 +432,57 @@ void loop() {
                   (unsigned long)fetch_failed);
   }
 
-  // Refresh the "updated Xs ago" footer once per second so it actually counts up.
-  if (grid_ready && millis() - last_footer_tick > 1000) {
+  if (current_screen == SCREEN_LIST && grid_ready &&
+      millis() - last_footer_tick > 1000) {
     draw_footer();
     last_footer_tick = millis();
   }
 
-  delay(50);
+  // Touch state machine. Track press-down → release; classify as tap or
+  // horizontal swipe based on distance and direction.
+  static bool     touch_active = false;
+  static int16_t  start_x = 0, start_y = 0;
+  static int16_t  last_x  = 0, last_y  = 0;
+  static uint32_t start_ms = 0;
+
+  int16_t tx, ty;
+  bool now_touched = touch_read(tx, ty);
+  if (now_touched) {
+    if (!touch_active) {
+      touch_active = true;
+      start_x = tx; start_y = ty;
+      start_ms = millis();
+    }
+    last_x = tx; last_y = ty;
+  } else if (touch_active) {
+    touch_active = false;
+    uint32_t dur = millis() - start_ms;
+    int16_t  dx  = last_x - start_x;
+    int16_t  dy  = last_y - start_y;
+    int16_t  adx = dx < 0 ? -dx : dx;
+    int16_t  ady = dy < 0 ? -dy : dy;
+
+    if (dur < 40) {
+      // ignore — too short, almost certainly a noise/contact bounce
+    } else if (adx > 60 && adx > ady * 2) {
+      int dir = dx > 0 ? +1 : -1;
+      Serial.printf("SWIPE dx=%d dir=%+d\n", dx, dir);
+      if (current_screen == SCREEN_DETAIL) {
+        goto_detail(current_coin + (dir > 0 ? -1 : +1));  // swipe-left = next coin
+      }
+    } else {
+      Serial.printf("TAP x=%d y=%d\n", last_x, last_y);
+      if (current_screen == SCREEN_LIST) {
+        int picked = -1;
+        if      (last_y >= BTC_Y && last_y < BTC_Y + ROW_HEIGHT) picked = 0;
+        else if (last_y >= ETH_Y && last_y < ETH_Y + ROW_HEIGHT) picked = 1;
+        else if (last_y >= SOL_Y && last_y < SOL_Y + ROW_HEIGHT) picked = 2;
+        if (picked >= 0) goto_detail(picked);
+      } else {
+        goto_list();
+      }
+    }
+  }
+
+  delay(20);
 }
