@@ -4,6 +4,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <time.h>
 #include <Arduino_GFX_Library.h>
 
 #include "secrets.h"
@@ -58,6 +59,22 @@ static bool     grid_ready     = false;   // is the coin grid currently on scree
 enum Screen { SCREEN_LIST, SCREEN_DETAIL };
 static Screen current_screen = SCREEN_LIST;
 static int    current_coin   = 0;   // 0=BTC, 1=ETH, 2=SOL — used by SCREEN_DETAIL
+
+static const int CHART_POINTS = 64;
+struct ChartData {
+  float    points[CHART_POINTS];
+  int      count;        // 0 = empty
+  uint32_t fetched_at;   // millis() — 0 if never
+};
+static ChartData charts[3] = {};
+static const uint32_t CHART_TTL_MS = 5UL * 60UL * 1000UL;  // 5 min — well under CG rate limit
+
+static const char *TZ_BOSNIA = "CET-1CEST,M3.5.0/2,M10.5.0/3";
+static bool ntp_synced = false;
+
+static bool format_time(char *out, size_t cap);
+static void ensure_chart_fresh(int coin_idx);
+static void draw_chart(int coin_idx);
 
 static const char *COINGECKO_URL =
     "https://api.coingecko.com/api/v3/simple/price"
@@ -211,18 +228,25 @@ static void draw_coin_row(int16_t y, const char *ticker, uint16_t ticker_color,
 
 static void draw_footer() {
   gfx->fillRect(0, FOOTER_Y, LCD_WIDTH, 20, COL_BG);
-
-  char buf[40];
-  if (last_fetch_ok == 0) {
-    snprintf(buf, sizeof(buf), "fetching...");
-  } else {
-    uint32_t age_s = (millis() - last_fetch_ok) / 1000;
-    snprintf(buf, sizeof(buf), "updated %lus ago", (unsigned long)age_s);
-  }
   gfx->setTextSize(1);
   gfx->setTextColor(COL_DIM);
-  gfx->setCursor((LCD_WIDTH - text_width(buf, 1)) / 2, FOOTER_Y + 4);
-  gfx->print(buf);
+
+  char left[40];
+  if (last_fetch_ok == 0) {
+    snprintf(left, sizeof(left), "fetching...");
+  } else {
+    snprintf(left, sizeof(left), "updated %lus ago",
+             (unsigned long)((millis() - last_fetch_ok) / 1000));
+  }
+  gfx->setCursor(MARGIN, FOOTER_Y + 4);
+  gfx->print(left);
+
+  char clock_buf[8];
+  if (format_time(clock_buf, sizeof(clock_buf))) {
+    int16_t w = text_width(clock_buf, 1);
+    gfx->setCursor(LCD_WIDTH - MARGIN - w, FOOTER_Y + 4);
+    gfx->print(clock_buf);
+  }
 }
 
 static void draw_grid() {
@@ -255,38 +279,153 @@ static void draw_detail() {
   uint16_t color = coin_color(current_coin);
   const CoinSnapshot &c = coin_snap(current_coin);
 
-  gfx->setTextSize(8);
+  gfx->setTextSize(6);
   gfx->setTextColor(color);
-  gfx->setCursor((LCD_WIDTH - text_width(name, 8)) / 2, 100);
+  gfx->setCursor((LCD_WIDTH - text_width(name, 6)) / 2, 100);
   gfx->print(name);
 
   if (!c.valid) {
     gfx->setTextSize(2);
     gfx->setTextColor(COL_DIM);
     const char *m = "no data yet";
-    gfx->setCursor((LCD_WIDTH - text_width(m, 2)) / 2, 220);
+    gfx->setCursor((LCD_WIDTH - text_width(m, 2)) / 2, 200);
     gfx->print(m);
   } else {
     char price_buf[24];
     format_money(price_buf, sizeof(price_buf), c.price_usd);
     gfx->setTextSize(5);
     gfx->setTextColor(COL_TITLE);
-    gfx->setCursor((LCD_WIDTH - text_width(price_buf, 5)) / 2, 220);
+    gfx->setCursor((LCD_WIDTH - text_width(price_buf, 5)) / 2, 180);
     gfx->print(price_buf);
 
     char pct_buf[16];
     format_pct(pct_buf, sizeof(pct_buf), c.change_24h_pct);
-    gfx->setTextSize(4);
+    gfx->setTextSize(3);
     gfx->setTextColor(c.change_24h_pct >= 0 ? COL_OK : COL_ERR);
-    gfx->setCursor((LCD_WIDTH - text_width(pct_buf, 4)) / 2, 300);
+    gfx->setCursor((LCD_WIDTH - text_width(pct_buf, 3)) / 2, 240);
     gfx->print(pct_buf);
   }
 
+  ensure_chart_fresh(current_coin);
+  draw_chart(current_coin);
+
   gfx->setTextSize(1);
   gfx->setTextColor(COL_DIM);
-  const char *hint = "tap = list   swipe < > = coin";
-  gfx->setCursor((LCD_WIDTH - text_width(hint, 1)) / 2, 410);
+  const char *hint = "tap=list  swipe<>";
+  gfx->setCursor(MARGIN, FOOTER_Y + 4);
   gfx->print(hint);
+  char clock_buf[8];
+  if (format_time(clock_buf, sizeof(clock_buf))) {
+    int16_t w = text_width(clock_buf, 1);
+    gfx->setCursor(LCD_WIDTH - MARGIN - w, FOOTER_Y + 4);
+    gfx->print(clock_buf);
+  }
+}
+
+// --- Chart fetch + draw ---
+static const int CHART_X0 = MARGIN;
+static const int CHART_X1 = LCD_WIDTH - MARGIN;
+static const int CHART_Y0 = 290;
+static const int CHART_Y1 = 380;
+
+static bool fetch_chart(int coin_idx) {
+  if (coin_idx < 0 || coin_idx > 2) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  const char *id = coin_idx == 0 ? "bitcoin"
+                 : coin_idx == 1 ? "ethereum"
+                 :                  "solana";
+  char url[160];
+  snprintf(url, sizeof(url),
+           "https://api.coingecko.com/api/v3/coins/%s/market_chart"
+           "?vs_currency=usd&days=1", id);
+
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient http;
+  if (!http.begin(client, url)) return false;
+  http.setUserAgent("CoinDeck/0.1 (ESP32-S3)");
+  http.setTimeout(12000);
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("chart HTTP %d for %s\n", code, id);
+    http.end();
+    return false;
+  }
+  String body = http.getString();
+  http.end();
+
+  // Filter so only the "prices" array gets parsed — drops ~2/3 of the payload.
+  JsonDocument filter; filter["prices"] = true;
+  JsonDocument doc;
+  if (deserializeJson(doc, body, DeserializationOption::Filter(filter))) {
+    Serial.println("chart JSON parse error");
+    return false;
+  }
+  JsonArray prices = doc["prices"];
+  int total = prices.size();
+  if (total < 2) return false;
+
+  ChartData &c = charts[coin_idx];
+  c.count = 0;
+  for (int i = 0; i < CHART_POINTS && c.count < CHART_POINTS; i++) {
+    int src = (int)((float)i * (total - 1) / (CHART_POINTS - 1));
+    JsonArray p = prices[src];
+    if (p.size() < 2) break;
+    c.points[c.count++] = p[1].as<float>();
+  }
+  c.fetched_at = millis();
+  Serial.printf("chart[%d] %d->%d pts, first=%.2f last=%.2f\n",
+                coin_idx, total, c.count,
+                c.points[0], c.points[c.count - 1]);
+  return true;
+}
+
+static void draw_chart(int coin_idx) {
+  const ChartData &c = charts[coin_idx];
+  const int w = CHART_X1 - CHART_X0;
+  const int h = CHART_Y1 - CHART_Y0;
+
+  gfx->fillRect(CHART_X0, CHART_Y0, w, h, COL_BG);
+
+  if (c.count < 2) {
+    gfx->setTextSize(1);
+    gfx->setTextColor(COL_DIM);
+    const char *m = "chart loading...";
+    gfx->setCursor((LCD_WIDTH - text_width(m, 1)) / 2, CHART_Y0 + h / 2 - 4);
+    gfx->print(m);
+    return;
+  }
+
+  float mn = c.points[0], mx = c.points[0];
+  for (int i = 1; i < c.count; i++) {
+    if (c.points[i] < mn) mn = c.points[i];
+    if (c.points[i] > mx) mx = c.points[i];
+  }
+  float rng = mx - mn;
+  if (rng < 0.0001f) rng = 0.0001f;  // flat line guard
+
+  uint16_t line_color = c.points[c.count - 1] >= c.points[0] ? COL_OK : COL_ERR;
+
+  // Thin baseline at min so the chart sits on a visible floor.
+  gfx->drawFastHLine(CHART_X0, CHART_Y1, w, COL_DIM);
+
+  int prev_x = CHART_X0;
+  int prev_y = CHART_Y1 - (int)((c.points[0] - mn) / rng * h);
+  for (int i = 1; i < c.count; i++) {
+    int x = CHART_X0 + (int)((float)i / (c.count - 1) * w);
+    int y = CHART_Y1 - (int)((c.points[i] - mn) / rng * h);
+    gfx->drawLine(prev_x, prev_y, x, y, line_color);
+    // Double-thickness — one extra pixel above so the line feels solid.
+    gfx->drawLine(prev_x, prev_y - 1, x, y - 1, line_color);
+    prev_x = x; prev_y = y;
+  }
+}
+
+static void ensure_chart_fresh(int coin_idx) {
+  ChartData &c = charts[coin_idx];
+  bool stale = (c.count == 0) || (millis() - c.fetched_at > CHART_TTL_MS);
+  if (!stale) return;
+  draw_chart(coin_idx);   // show "chart loading..." placeholder
+  fetch_chart(coin_idx);
 }
 
 static void redraw_current_screen() {
@@ -303,6 +442,25 @@ static void goto_detail(int coin_idx) {
   current_coin = (coin_idx + 3) % 3;
   current_screen = SCREEN_DETAIL;
   redraw_current_screen();
+}
+
+// --- Time / NTP ---
+static void ntp_begin() {
+  configTzTime(TZ_BOSNIA, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+  struct tm t;
+  if (getLocalTime(&t, 4000)) {
+    ntp_synced = true;
+    Serial.printf("NTP synced: %02d:%02d:%02d\n", t.tm_hour, t.tm_min, t.tm_sec);
+  } else {
+    Serial.println("NTP sync timeout (will retry implicitly via SNTP)");
+  }
+}
+
+static bool format_time(char *out, size_t cap) {
+  struct tm t;
+  if (!getLocalTime(&t, 0)) return false;
+  strftime(out, cap, "%H:%M", &t);
+  return true;
 }
 
 // --- WiFi ---
@@ -334,6 +492,7 @@ static bool wifi_connect(uint32_t timeout_ms = 20000) {
   status_line(280, COL_DIM, buf);
   Serial.printf("WiFi OK. IP=%s, RSSI=%d dBm\n",
                 WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+  ntp_begin();
   return true;
 }
 
@@ -432,9 +591,21 @@ void loop() {
                   (unsigned long)fetch_failed);
   }
 
-  if (current_screen == SCREEN_LIST && grid_ready &&
-      millis() - last_footer_tick > 1000) {
-    draw_footer();
+  if (millis() - last_footer_tick > 1000) {
+    if (current_screen == SCREEN_LIST && grid_ready) {
+      draw_footer();
+    } else if (current_screen == SCREEN_DETAIL) {
+      // Repaint only the clock corner; leave the chart and text alone.
+      gfx->fillRect(LCD_WIDTH - MARGIN - 60, FOOTER_Y + 4, 60, 12, COL_BG);
+      char clock_buf[8];
+      if (format_time(clock_buf, sizeof(clock_buf))) {
+        gfx->setTextSize(1);
+        gfx->setTextColor(COL_DIM);
+        int16_t w = text_width(clock_buf, 1);
+        gfx->setCursor(LCD_WIDTH - MARGIN - w, FOOTER_Y + 4);
+        gfx->print(clock_buf);
+      }
+    }
     last_footer_tick = millis();
   }
 
