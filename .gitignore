@@ -1,0 +1,15 @@
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Local secrets — WiFi creds etc. (added in step 3)
+src/secrets.h
+secrets.h
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*~
