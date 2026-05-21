@@ -32,8 +32,8 @@ Ako upload ne uspije iz prve: drži `BOOT` taster, kratko pritisni `RESET`, pust
 - [x] Korak 0 — projekat skeleton
 - [x] Korak 1 — smoke test (Serial print, PSRAM check)
 - [x] Korak 2 — SH8601 display "Hello World" (Arduino_GFX)
-- [ ] Korak 3 — WiFi konekcija
-- [ ] Korak 4 — CoinGecko API fetch
+- [x] Korak 3 — WiFi konekcija
+- [x] Korak 4 — CoinGecko API fetch
 - [ ] Korak 5 — LVGL UI prvi screen
 - [ ] Korak 6 — Touch + swipe između ekrana
 - [ ] Korak 7 — Polish (fontovi, glow, mini chart)
