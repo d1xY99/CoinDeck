@@ -1,0 +1,15 @@
+[Unit]
+Description=CoinDeck GitHub dashboard daemon (push PR/CI counts to ESP32)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/Desktop/amoled-project/CoinDeck/tools/github_dashboard_daemon.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:%h/.local/state/github-coindeck.log
+StandardError=append:%h/.local/state/github-coindeck.log
+
+[Install]
+WantedBy=default.target

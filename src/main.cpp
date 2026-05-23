@@ -187,6 +187,22 @@ static const uint32_t CLAUDE_FRESH_MS = 180UL * 1000UL;  // daemon polls every 6
 static uint16_t clawd_frame = 0;
 static uint32_t clawd_frame_started = 0;
 
+// GitHub dashboard state (pushed by tools/github_dashboard_daemon.py)
+static int      gh_open_prs        = -1;   // -1 = no data
+static int      gh_review_requested = 0;
+static int      gh_ci_passed       = 0;
+static int      gh_ci_failed       = 0;
+static int      gh_ci_pending      = 0;
+static uint32_t gh_last_update     = 0;
+static const uint32_t GH_FRESH_MS  = 5UL * 60UL * 1000UL;
+
+struct GhPr { int num; char title[56]; };
+static const int GH_PR_MAX = 5;
+static GhPr gh_prs[GH_PR_MAX];
+static int  gh_pr_count = 0;
+static GhPr gh_reviews[GH_PR_MAX];
+static int  gh_review_count = 0;
+
 // WMO weather code → short label (matches Open-Meteo's `current.weather_code`).
 static const char *weather_label(int code) {
   if (code == 0)            return "clear";
@@ -604,23 +620,130 @@ static void draw_page_indicator_at(int y_center) {
   }
 }
 
+// Strip Conventional-Commit style prefix: "feat(scope): title" -> "title".
+static const char *strip_cc_prefix(const char *src) {
+  const char *colon = strchr(src, ':');
+  if (!colon) return src;
+  const char *after = colon + 1;
+  while (*after == ' ' || *after == '\t') after++;
+  return *after ? after : src;
+}
+
 static void draw_page2() {
   gfx->fillScreen(COL_BG);
+  gfx->drawFastVLine(DIVIDER_X, 0, LCD_H, COL_DIM);
 
-  gfx->setTextSize(4);
+  // Header
+  gfx->setTextSize(2);
   gfx->setTextColor(COL_TITLE);
-  const char *t = "Page 2";
-  gfx->setCursor((LCD_W - text_width(t, 4)) / 2, 100);
+  const char *t = "GitHub";
+  gfx->setCursor((LEFT_W - text_width(t, 2)) / 2, 12);
   gfx->print(t);
 
+  bool has_data = gh_open_prs >= 0;
+  bool live     = has_data && (millis() - gh_last_update < GH_FRESH_MS);
+  uint16_t dot_color = !has_data ? COL_DIM : live ? COL_OK : COL_WARN;
+  gfx->fillCircle(LEFT_W / 2 + text_width(t, 2) / 2 + 10, 20, 3, dot_color);
+
+  // Right-column placeholder
   gfx->setTextSize(1);
   gfx->setTextColor(COL_DIM);
-  const char *hint1 = "more widgets go here";
-  const char *hint2 = "swipe right to go back";
-  gfx->setCursor((LCD_W - text_width(hint1, 1)) / 2, 160);
-  gfx->print(hint1);
-  gfx->setCursor((LCD_W - text_width(hint2, 1)) / 2, 178);
-  gfx->print(hint2);
+  const char *rhint = "more widgets here";
+  int rcx = DIVIDER_X + RIGHT_W / 2;
+  gfx->setCursor(rcx - text_width(rhint, 1) / 2, LCD_H / 2 - 4);
+  gfx->print(rhint);
+
+  if (!has_data) {
+    const char *m = "waiting for daemon...";
+    gfx->setCursor((LEFT_W - text_width(m, 1)) / 2, LCD_H / 2 - 4);
+    gfx->print(m);
+    draw_page_indicator_at(FOOTER_Y + 12);
+    gfx->flush();
+    grid_ready = true;
+    return;
+  }
+
+  // Stacked sections: Open on top, Reviews below. Each: label + hline + rows.
+  // Title size 2 (~12 px / char), max ~18 chars in the 260-px-wide column.
+  auto draw_section = [&](int y_start, const char *label, int count,
+                          uint16_t label_color, const GhPr *list,
+                          int list_count, int max_rows) -> int {
+    char hbuf[24];
+    snprintf(hbuf, sizeof(hbuf), "%s (%d)", label, count);
+    gfx->setTextSize(1);
+    gfx->setTextColor(label_color);
+    gfx->setCursor(12, y_start);
+    gfx->print(hbuf);
+    int y = y_start + 12;
+    gfx->drawFastHLine(12, y, LEFT_W - 24, COL_DIM);
+    y += 6;
+
+    if (list_count == 0) {
+      gfx->setTextColor(COL_DIM);
+      gfx->setCursor(20, y + 2);
+      gfx->print("-");
+      return y + 20;
+    }
+
+    const int row_h = 20;
+    int rows = list_count < max_rows ? list_count : max_rows;
+    for (int i = 0; i < rows; i++) {
+      char numbuf[8];
+      snprintf(numbuf, sizeof(numbuf), "#%d", list[i].num);
+      int num_w = text_width(numbuf, 2);
+      gfx->setTextSize(2);
+      gfx->setTextColor(COL_DIM);
+      gfx->setCursor(12, y + i * row_h);
+      gfx->print(numbuf);
+
+      const char *cleaned = strip_cc_prefix(list[i].title);
+      int avail     = LEFT_W - 24 - num_w - 6;  // remaining px
+      int max_chars = avail / 12;                // size 2 ≈ 12 px / char
+      if (max_chars < 1) max_chars = 1;
+      char title[40];
+      if ((int)strlen(cleaned) > max_chars) {
+        int keep = max_chars - 1;  // last char becomes '~' as truncation hint
+        if (keep < 1) keep = 1;
+        strncpy(title, cleaned, keep);
+        title[keep] = '~';
+        title[keep + 1] = 0;
+      } else {
+        strcpy(title, cleaned);
+      }
+      gfx->setTextColor(COL_TITLE);
+      gfx->setCursor(12 + num_w + 6, y + i * row_h);
+      gfx->print(title);
+    }
+    return y + rows * row_h + 4;
+  };
+
+  int y = 36;
+  y = draw_section(y, "Open",    gh_open_prs,         COL_TITLE,
+                   gh_prs,     gh_pr_count, 5);
+  y += 4;
+  draw_section(y, "Reviews", gh_review_requested,
+               gh_review_requested > 0 ? COL_WARN : COL_DIM,
+               gh_reviews, gh_review_count, 3);
+
+  // CI line at bottom of left column
+  int y_ci = FOOTER_Y - 6;
+  gfx->setTextSize(1);
+  char nbuf[8];
+  snprintf(nbuf, sizeof(nbuf), "%d", gh_ci_passed);  int wp = text_width(nbuf, 1);
+  snprintf(nbuf, sizeof(nbuf), "%d", gh_ci_failed);  int wf = text_width(nbuf, 1);
+  snprintf(nbuf, sizeof(nbuf), "%d", gh_ci_pending); int wn = text_width(nbuf, 1);
+  const char *s_pass = " ok  ", *s_fail = " fail  ", *s_pend = " pend";
+  int total = wp + text_width(s_pass, 1) + wf + text_width(s_fail, 1) + wn + text_width(s_pend, 1);
+  int x = (LEFT_W - total) / 2;
+  gfx->setTextColor(COL_OK);  snprintf(nbuf, sizeof(nbuf), "%d", gh_ci_passed);
+  gfx->setCursor(x, y_ci); gfx->print(nbuf); x += wp;
+  gfx->setTextColor(COL_DIM); gfx->setCursor(x, y_ci); gfx->print(s_pass); x += text_width(s_pass, 1);
+  gfx->setTextColor(COL_ERR); snprintf(nbuf, sizeof(nbuf), "%d", gh_ci_failed);
+  gfx->setCursor(x, y_ci); gfx->print(nbuf); x += wf;
+  gfx->setTextColor(COL_DIM); gfx->setCursor(x, y_ci); gfx->print(s_fail); x += text_width(s_fail, 1);
+  gfx->setTextColor(COL_WARN);snprintf(nbuf, sizeof(nbuf), "%d", gh_ci_pending);
+  gfx->setCursor(x, y_ci); gfx->print(nbuf); x += wn;
+  gfx->setTextColor(COL_DIM); gfx->setCursor(x, y_ci); gfx->print(s_pend);
 
   draw_page_indicator_at(FOOTER_Y + 12);
   gfx->flush();
@@ -808,9 +931,43 @@ void setup() {
     http_server.send(200, "application/json", "{\"ok\":true}");
     if (current_screen == SCREEN_LIST && grid_ready) redraw_current_screen();
   });
+  http_server.on("/github", HTTP_POST, []() {
+    String body = http_server.arg("plain");
+    JsonDocument doc;
+    if (deserializeJson(doc, body)) {
+      http_server.send(400, "application/json", "{\"ok\":false,\"err\":\"bad json\"}");
+      return;
+    }
+    gh_open_prs         = doc["open_prs"]         | -1;
+    gh_review_requested = doc["review_requested"] | 0;
+    gh_ci_passed        = doc["ci_passed"]        | 0;
+    gh_ci_failed        = doc["ci_failed"]        | 0;
+    gh_ci_pending       = doc["ci_pending"]       | 0;
+    gh_last_update      = millis();
+
+    auto copy_list = [](JsonArray arr, GhPr *dst, int &count) {
+      count = 0;
+      for (JsonObject pr : arr) {
+        if (count >= GH_PR_MAX) break;
+        dst[count].num = pr["n"] | 0;
+        const char *t = pr["t"] | "";
+        strncpy(dst[count].title, t, sizeof(dst[count].title) - 1);
+        dst[count].title[sizeof(dst[count].title) - 1] = 0;
+        count++;
+      }
+    };
+    copy_list(doc["prs"].as<JsonArray>(),     gh_prs,     gh_pr_count);
+    copy_list(doc["reviews"].as<JsonArray>(), gh_reviews, gh_review_count);
+
+    Serial.printf("[github] PRs=%d (%d titles) reviews=%d (%d titles) ci=%dP/%dF/%d~\n",
+                  gh_open_prs, gh_pr_count, gh_review_requested, gh_review_count,
+                  gh_ci_passed, gh_ci_failed, gh_ci_pending);
+    http_server.send(200, "application/json", "{\"ok\":true}");
+    if (current_screen == SCREEN_LIST && current_page == 1) redraw_current_screen();
+  });
   http_server.on("/", HTTP_GET, []() {
     http_server.send(200, "text/plain",
-                     "CoinDeck up. POST /usage with {session_pct, session_reset_min, weekly_pct, weekly_reset_min}.");
+                     "CoinDeck. POST /usage (Claude) or /github (dashboard).");
   });
   http_server.begin();
   Serial.printf("HTTP server up on %s:8080\n", WiFi.localIP().toString().c_str());
