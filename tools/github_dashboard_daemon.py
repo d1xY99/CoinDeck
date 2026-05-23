@@ -75,21 +75,25 @@ def poll():
 
     raw_open    = gh_query_items("is:pr is:open author:@me")           or []
     raw_review  = gh_query_items("is:pr is:open review-requested:@me") or []
+    raw_issues  = gh_query_items("is:issue is:open assignee:@me")      or []
     raw_pass    = gh_query_items("is:pr is:open author:@me status:success") or []
     raw_fail    = gh_query_items("is:pr is:open author:@me status:failure") or []
     raw_pend    = gh_query_items("is:pr is:open author:@me status:pending") or []
 
     open_items   = filtered(raw_open)
     review_items = filtered(raw_review)
+    issue_items  = filtered(raw_issues)
 
     return {
         "open_prs":         len(open_items),
         "review_requested": len(review_items),
+        "issues_assigned":  len(issue_items),
         "ci_passed":        len(filtered(raw_pass)),
         "ci_failed":        len(filtered(raw_fail)),
         "ci_pending":       len(filtered(raw_pend)),
         "prs":              [{"n": i["number"], "t": i["title"]} for i in open_items[:5]],
         "reviews":          [{"n": i["number"], "t": i["title"]} for i in review_items[:5]],
+        "issues":           [{"n": i["number"], "t": i["title"]} for i in issue_items[:5]],
     }
 
 def push(payload):
@@ -115,7 +119,8 @@ def main():
     log(f"polling github every {POLL_S}s, pushing to {ESP32_URL}")
     while not _stop:
         p = poll()
-        log(f"PRs={p['open_prs']} reviews={p['review_requested']}  "
+        log(f"PRs={p['open_prs']} reviews={p['review_requested']} "
+            f"issues={p['issues_assigned']}  "
             f"ci={p['ci_passed']}P/{p['ci_failed']}F/{p['ci_pending']}~")
         push(p)
         for _ in range(POLL_S):

@@ -73,9 +73,14 @@ static uint32_t fetch_count    = 0;
 static uint32_t fetch_failed   = 0;
 static bool     grid_ready     = false;
 
-enum Screen { SCREEN_LIST, SCREEN_DETAIL };
+enum Screen { SCREEN_LIST, SCREEN_DETAIL, SCREEN_GITHUB_DETAIL, SCREEN_ISSUES_DETAIL };
 static Screen current_screen = SCREEN_LIST;
 static int    current_coin   = 0;
+
+// Y bounds of the "Issues" section inside the GitHub detail screen, captured
+// during render so the touch handler can tell when a tap lands on it.
+static int gh_issues_band_top = -1;
+static int gh_issues_band_bot = -1;
 
 // Top-level pages on SCREEN_LIST — bump PAGE_COUNT to add more.
 static const int PAGE_COUNT = 2;
@@ -220,6 +225,9 @@ static GhPr gh_prs[GH_PR_MAX];
 static int  gh_pr_count = 0;
 static GhPr gh_reviews[GH_PR_MAX];
 static int  gh_review_count = 0;
+static int  gh_issues_assigned = 0;
+static GhPr gh_issues[GH_PR_MAX];
+static int  gh_issue_count = 0;
 
 // WMO weather code → short label (matches Open-Meteo's `current.weather_code`).
 static const char *weather_label(int code) {
@@ -819,10 +827,157 @@ static void draw_page2() {
   grid_ready = true;
 }
 
+static void draw_github_detail() {
+  gfx->fillScreen(COL_BG);
+
+  // Small/condensed rendering — same trick we use elsewhere: 6 px wide, 16 px tall.
+  auto draw_pr_row = [&](int y, const GhPr &pr) {
+    char numbuf[8];
+    snprintf(numbuf, sizeof(numbuf), "#%d", pr.num);
+    int num_w = text_width(numbuf, 1);
+    gfx->setTextSize(1, 2);
+    gfx->setTextColor(COL_DIM);
+    gfx->setCursor(MARGIN, y);
+    gfx->print(numbuf);
+
+    const char *cleaned = strip_cc_prefix(pr.title);
+    int avail = LCD_W - MARGIN * 2 - num_w - 8;
+    int max_chars = avail / 6;
+    if (max_chars < 1) max_chars = 1;
+    char title[80];
+    if ((int)strlen(cleaned) > max_chars) {
+      int keep = max_chars - 1;
+      if (keep < 1) keep = 1;
+      strncpy(title, cleaned, keep);
+      title[keep] = '~';
+      title[keep + 1] = 0;
+    } else {
+      strcpy(title, cleaned);
+    }
+    gfx->setTextColor(COL_TITLE);
+    gfx->setCursor(MARGIN + num_w + 8, y);
+    gfx->print(title);
+  };
+
+  auto draw_section = [&](int y, const char *label, int count, uint16_t label_color,
+                          const GhPr *list, int list_count, int max_rows,
+                          int *out_top = nullptr, int *out_bot = nullptr) -> int {
+    int section_top = y;
+    char hbuf[32];
+    snprintf(hbuf, sizeof(hbuf), "%s (%d)", label, count);
+    gfx->setTextSize(2);
+    gfx->setTextColor(label_color);
+    gfx->setCursor(MARGIN, y);
+    gfx->print(hbuf);
+    y += 18;
+    gfx->drawFastHLine(MARGIN, y, LCD_W - MARGIN * 2, COL_DIM);
+    y += 4;
+
+    if (list_count == 0) {
+      gfx->setTextSize(1, 2);
+      gfx->setTextColor(COL_DIM);
+      gfx->setCursor(MARGIN + 4, y);
+      gfx->print("-");
+      y += 18;
+    } else {
+      int rows = list_count < max_rows ? list_count : max_rows;
+      const int row_h = 18;
+      for (int i = 0; i < rows; i++) {
+        draw_pr_row(y, list[i]);
+        y += row_h;
+      }
+    }
+    if (out_top) *out_top = section_top;
+    if (out_bot) *out_bot = y;
+    return y;
+  };
+
+  int y = 8;
+  y = draw_section(y, "Open PRs", gh_open_prs, COL_TITLE,
+                   gh_prs, gh_pr_count, 5);
+  y += 6;
+  y = draw_section(y, "Reviews", gh_review_requested,
+                   gh_review_requested > 0 ? COL_WARN : COL_TITLE,
+                   gh_reviews, gh_review_count, 3);
+  y += 6;
+  draw_section(y, "Issues", gh_issues_assigned,
+               gh_issues_assigned > 0 ? COL_WARN : COL_TITLE,
+               gh_issues, gh_issue_count, 3,
+               &gh_issues_band_top, &gh_issues_band_bot);
+
+  gfx->setTextSize(1);
+  gfx->setTextColor(COL_DIM);
+  const char *hint = "tap Issues for full list  -  tap elsewhere = back";
+  gfx->setCursor((LCD_W - text_width(hint, 1)) / 2, LCD_H - 10);
+  gfx->print(hint);
+
+  gfx->flush();
+}
+
+static void draw_issues_detail() {
+  gfx->fillScreen(COL_BG);
+
+  gfx->setTextSize(3);
+  gfx->setTextColor(COL_WARN);
+  char hbuf[24];
+  snprintf(hbuf, sizeof(hbuf), "Issues (%d)", gh_issues_assigned);
+  gfx->setCursor(MARGIN, 8);
+  gfx->print(hbuf);
+  gfx->drawFastHLine(MARGIN, 38, LCD_W - 2 * MARGIN, COL_DIM);
+
+  if (gh_issue_count == 0) {
+    gfx->setTextSize(2);
+    gfx->setTextColor(COL_DIM);
+    const char *m = "no open issues assigned to you";
+    gfx->setCursor((LCD_W - text_width(m, 2)) / 2, LCD_H / 2);
+    gfx->print(m);
+  } else {
+    int y = 50;
+    const int row_h = 28;
+    for (int i = 0; i < gh_issue_count && y + row_h < LCD_H - 16; i++) {
+      char numbuf[8];
+      snprintf(numbuf, sizeof(numbuf), "#%d", gh_issues[i].num);
+      int num_w = text_width(numbuf, 2);
+      gfx->setTextSize(2);
+      gfx->setTextColor(COL_DIM);
+      gfx->setCursor(MARGIN, y);
+      gfx->print(numbuf);
+
+      const char *cleaned = strip_cc_prefix(gh_issues[i].title);
+      int avail = LCD_W - 2 * MARGIN - num_w - 10;
+      int max_chars = avail / 12;
+      char title[64];
+      if ((int)strlen(cleaned) > max_chars) {
+        int keep = max_chars - 1;
+        if (keep < 1) keep = 1;
+        strncpy(title, cleaned, keep);
+        title[keep] = '~';
+        title[keep + 1] = 0;
+      } else {
+        strcpy(title, cleaned);
+      }
+      gfx->setTextColor(COL_TITLE);
+      gfx->setCursor(MARGIN + num_w + 10, y);
+      gfx->print(title);
+      y += row_h;
+    }
+  }
+
+  gfx->setTextSize(1);
+  gfx->setTextColor(COL_DIM);
+  const char *hint = "tap to go back";
+  gfx->setCursor((LCD_W - text_width(hint, 1)) / 2, LCD_H - 10);
+  gfx->print(hint);
+
+  gfx->flush();
+}
+
 static void redraw_current_screen() {
-  if (current_screen == SCREEN_DETAIL) { draw_detail(); return; }
-  if (current_page == 0) draw_page2();        // GitHub on page 0
-  else                   draw_page_crypto();  // CoinDeck full-screen on page 1
+  if (current_screen == SCREEN_DETAIL)         { draw_detail();         return; }
+  if (current_screen == SCREEN_GITHUB_DETAIL)  { draw_github_detail();  return; }
+  if (current_screen == SCREEN_ISSUES_DETAIL)  { draw_issues_detail();  return; }
+  if (current_page == 0) draw_page2();
+  else                   draw_page_crypto();
 }
 
 static void goto_list() {
@@ -833,6 +988,16 @@ static void goto_list() {
 static void goto_detail(int coin_idx) {
   current_coin = (coin_idx + COIN_COUNT) % COIN_COUNT;
   current_screen = SCREEN_DETAIL;
+  redraw_current_screen();
+}
+
+static void goto_github_detail() {
+  current_screen = SCREEN_GITHUB_DETAIL;
+  redraw_current_screen();
+}
+
+static void goto_issues_detail() {
+  current_screen = SCREEN_ISSUES_DETAIL;
   redraw_current_screen();
 }
 
@@ -1015,6 +1180,7 @@ void setup() {
     }
     gh_open_prs         = doc["open_prs"]         | -1;
     gh_review_requested = doc["review_requested"] | 0;
+    gh_issues_assigned  = doc["issues_assigned"]  | 0;
     gh_ci_passed        = doc["ci_passed"]        | 0;
     gh_ci_failed        = doc["ci_failed"]        | 0;
     gh_ci_pending       = doc["ci_pending"]       | 0;
@@ -1033,12 +1199,17 @@ void setup() {
     };
     copy_list(doc["prs"].as<JsonArray>(),     gh_prs,     gh_pr_count);
     copy_list(doc["reviews"].as<JsonArray>(), gh_reviews, gh_review_count);
+    copy_list(doc["issues"].as<JsonArray>(),  gh_issues,  gh_issue_count);
 
-    Serial.printf("[github] PRs=%d (%d titles) reviews=%d (%d titles) ci=%dP/%dF/%d~\n",
+    Serial.printf("[github] PRs=%d/%d  reviews=%d/%d  issues=%d/%d  ci=%dP/%dF/%d~\n",
                   gh_open_prs, gh_pr_count, gh_review_requested, gh_review_count,
+                  gh_issues_assigned, gh_issue_count,
                   gh_ci_passed, gh_ci_failed, gh_ci_pending);
     http_server.send(200, "application/json", "{\"ok\":true}");
-    if (current_screen == SCREEN_LIST && current_page == 0) redraw_current_screen();
+    if ((current_screen == SCREEN_LIST && current_page == 0) ||
+         current_screen == SCREEN_GITHUB_DETAIL) {
+      redraw_current_screen();
+    }
   });
   http_server.on("/", HTTP_GET, []() {
     http_server.send(200, "text/plain",
@@ -1123,19 +1294,20 @@ void loop() {
       Serial.printf("SWIPE dx=%d dir=%+d\n", dx, dir);
       if (current_screen == SCREEN_DETAIL) {
         goto_detail(current_coin + (dir > 0 ? -1 : +1));
-      } else {
-        // SCREEN_LIST: swipe-left → next page, swipe-right → previous.
+      } else if (current_screen == SCREEN_LIST) {
+        // swipe-left → next page, swipe-right → previous
         int next = current_page + (dir > 0 ? -1 : +1);
         if (next >= 0 && next < PAGE_COUNT && next != current_page) {
           current_page = next;
           redraw_current_screen();
         }
       }
+      // swipe on SCREEN_GITHUB_DETAIL: ignore for now
     } else {
       Serial.printf("TAP x=%d y=%d\n", last_x, last_y);
       if (current_screen == SCREEN_LIST) {
-        // Crypto rows live on page 1 now; tap them to open detail view.
         if (current_page == 1) {
+          // Page 1 crypto: tap a coin row to open detail.
           for (int i = 0; i < COIN_COUNT; i++) {
             int top = CRYPTO_ROW0 + i * CRYPTO_ROW_H;
             if (last_y >= top && last_y < top + CRYPTO_ROW_H) {
@@ -1143,7 +1315,20 @@ void loop() {
               break;
             }
           }
+        } else if (current_page == 0 && last_x < LEFT_W) {
+          // Page 0 GitHub box (anywhere in left column) → full-screen detail.
+          goto_github_detail();
         }
+      } else if (current_screen == SCREEN_GITHUB_DETAIL) {
+        // Tap in the Issues band opens issues-only page; tap elsewhere goes back.
+        if (gh_issues_band_top >= 0 && last_y >= gh_issues_band_top &&
+            last_y <= gh_issues_band_bot) {
+          goto_issues_detail();
+        } else {
+          goto_list();
+        }
+      } else if (current_screen == SCREEN_ISSUES_DETAIL) {
+        goto_github_detail();
       } else {
         goto_list();
       }
