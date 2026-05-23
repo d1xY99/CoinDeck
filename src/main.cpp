@@ -144,26 +144,50 @@ static int16_t text_width(const char *s, uint8_t size) {
   return (int16_t)(strlen(s) * 6 * size);
 }
 
-// --- Layout (480x320 landscape) ---
+// --- Layout (480x320 landscape, split screen) ---
 static const int16_t MARGIN     = 16;
 static const int16_t ROW_HEIGHT = 70;
 static const int16_t BTC_Y      = 60;
 static const int16_t ETH_Y      = 140;
 static const int16_t SOL_Y      = 220;
 static const int16_t FOOTER_Y   = 300;
+static const int16_t LEFT_W     = 260;   // crypto column width — tightened to give right column more room
+static const int16_t DIVIDER_X  = 260;
+static const int16_t RIGHT_W    = LCD_W - DIVIDER_X;  // 220 px wide
+static const int16_t CLAUDE_Y   = 140;   // start of Claude box in right column
+
+// --- Weather (Open-Meteo for Graz, Austria — no API key required) ---
+static const float GRAZ_LAT = 47.0708f;
+static const float GRAZ_LON = 15.4395f;
+static float    weather_temp_c    = 0;
+static int      weather_code      = -1;   // -1 = unknown
+static uint32_t weather_fetched_at = 0;
+static const uint32_t WEATHER_TTL_MS = 10UL * 60UL * 1000UL;
+
+// WMO weather code → short label (matches Open-Meteo's `current.weather_code`).
+static const char *weather_label(int code) {
+  if (code == 0)            return "clear";
+  if (code <= 3)            return "cloudy";
+  if (code == 45 || code == 48) return "fog";
+  if (code >= 51 && code <= 67) return "rain";
+  if (code >= 71 && code <= 77) return "snow";
+  if (code >= 80 && code <= 86) return "shower";
+  if (code >= 95)           return "storm";
+  return "?";
+}
 
 static void draw_header_into_canvas() {
   gfx->setTextSize(3);
   gfx->setTextColor(COL_TITLE);
   int16_t w = text_width("CoinDeck", 3);
-  gfx->setCursor((LCD_W - w) / 2, 12);
+  gfx->setCursor((LEFT_W - w) / 2, 12);
   gfx->print("CoinDeck");
 
   gfx->setTextSize(1);
   gfx->setTextColor(COL_DIM);
   const char *sub = "crypto desk ticker";
   w = text_width(sub, 1);
-  gfx->setCursor((LCD_W - w) / 2, 42);
+  gfx->setCursor((LEFT_W - w) / 2, 42);
   gfx->print(sub);
 }
 
@@ -190,7 +214,7 @@ static void draw_coin_row(int16_t y, const char *ticker, uint16_t ticker_color,
     gfx->setTextSize(2);
     gfx->setTextColor(COL_DIM);
     const char *msg = "no data";
-    gfx->setCursor(LCD_W - MARGIN - text_width(msg, 2), y + 18);
+    gfx->setCursor(LEFT_W - MARGIN - text_width(msg, 2), y + 18);
     gfx->print(msg);
     return;
   }
@@ -200,7 +224,7 @@ static void draw_coin_row(int16_t y, const char *ticker, uint16_t ticker_color,
   gfx->setTextSize(3);
   gfx->setTextColor(COL_TITLE);
   int16_t price_w = text_width(price_buf, 3);
-  gfx->setCursor(LCD_W - MARGIN - price_w, y + 10);
+  gfx->setCursor(LEFT_W - MARGIN - price_w, y + 10);
   gfx->print(price_buf);
 
   char pct_buf[16];
@@ -208,14 +232,85 @@ static void draw_coin_row(int16_t y, const char *ticker, uint16_t ticker_color,
   gfx->setTextSize(2);
   gfx->setTextColor(c.change_24h_pct >= 0 ? COL_OK : COL_ERR);
   int16_t pct_w = text_width(pct_buf, 2);
-  gfx->setCursor(LCD_W - MARGIN - pct_w, y + 44);
+  gfx->setCursor(LEFT_W - MARGIN - pct_w, y + 44);
   gfx->print(pct_buf);
+}
+
+static void draw_right_column() {
+  // Vertical divider
+  gfx->drawFastVLine(DIVIDER_X, 0, LCD_H, COL_DIM);
+
+  const int rx = DIVIDER_X + 1;
+  const int rcenter = DIVIDER_X + RIGHT_W / 2;
+
+  // City label
+  gfx->setTextSize(1);
+  gfx->setTextColor(COL_DIM);
+  const char *city = "Graz";
+  gfx->setCursor(rcenter - text_width(city, 1) / 2, 8);
+  gfx->print(city);
+
+  // Clock (HH:MM, big)
+  char clock_buf[8];
+  if (format_time(clock_buf, sizeof(clock_buf))) {
+    gfx->setTextSize(4);
+    gfx->setTextColor(COL_TITLE);
+    int16_t w = text_width(clock_buf, 4);
+    gfx->setCursor(rcenter - w / 2, 26);
+    gfx->print(clock_buf);
+  } else {
+    gfx->setTextSize(1);
+    gfx->setTextColor(COL_DIM);
+    gfx->setCursor(rcenter - text_width("syncing...", 1) / 2, 36);
+    gfx->print("syncing...");
+  }
+
+  // Temperature
+  if (weather_code >= 0) {
+    char temp_buf[16];
+    snprintf(temp_buf, sizeof(temp_buf), "%dC", (int)(weather_temp_c + (weather_temp_c >= 0 ? 0.5f : -0.5f)));
+    gfx->setTextSize(3);
+    gfx->setTextColor(COL_WARN);
+    int16_t w = text_width(temp_buf, 3);
+    gfx->setCursor(rcenter - w / 2, 75);
+    gfx->print(temp_buf);
+
+    const char *wlabel = weather_label(weather_code);
+    gfx->setTextSize(1);
+    gfx->setTextColor(COL_DIM);
+    gfx->setCursor(rcenter - text_width(wlabel, 1) / 2, 108);
+    gfx->print(wlabel);
+  } else {
+    gfx->setTextSize(1);
+    gfx->setTextColor(COL_DIM);
+    gfx->setCursor(rcenter - text_width("...", 1) / 2, 90);
+    gfx->print("...");
+  }
+
+  // Horizontal divider above Claude box
+  gfx->drawFastHLine(rx + 4, CLAUDE_Y, RIGHT_W - 8, COL_DIM);
+
+  // Claude session placeholder — will be wired to a Claude Code hook later.
+  gfx->setTextSize(2);
+  gfx->setTextColor(COL_TITLE);
+  const char *claude_title = "Claude";
+  gfx->setCursor(rcenter - text_width(claude_title, 2) / 2, CLAUDE_Y + 10);
+  gfx->print(claude_title);
+
+  gfx->setTextSize(1);
+  gfx->setTextColor(COL_DIM);
+  const char *sub = "session";
+  gfx->setCursor(rcenter - text_width(sub, 1) / 2, CLAUDE_Y + 34);
+  gfx->print(sub);
+
+  gfx->setTextColor(COL_DIM);
+  gfx->setCursor(rcenter - text_width("waiting...", 1) / 2, CLAUDE_Y + 80);
+  gfx->print("waiting...");
 }
 
 static void draw_footer_into_canvas() {
   gfx->setTextSize(1);
   gfx->setTextColor(COL_DIM);
-
   char left[40];
   if (last_fetch_ok == 0) {
     snprintf(left, sizeof(left), "fetching...");
@@ -225,13 +320,6 @@ static void draw_footer_into_canvas() {
   }
   gfx->setCursor(MARGIN, FOOTER_Y + 6);
   gfx->print(left);
-
-  char clock_buf[8];
-  if (format_time(clock_buf, sizeof(clock_buf))) {
-    int16_t w = text_width(clock_buf, 1);
-    gfx->setCursor(LCD_W - MARGIN - w, FOOTER_Y + 6);
-    gfx->print(clock_buf);
-  }
 }
 
 static void draw_grid() {
@@ -241,6 +329,7 @@ static void draw_grid() {
   draw_coin_row(ETH_Y, "ETH", COL_ETH, eth);
   draw_coin_row(SOL_Y, "SOL", COL_SOL, sol);
   draw_footer_into_canvas();
+  draw_right_column();
   gfx->flush();
   grid_ready = true;
 }
@@ -467,6 +556,39 @@ static bool wifi_connect(uint32_t timeout_ms = 20000) {
   return true;
 }
 
+static bool fetch_weather() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  char url[256];
+  snprintf(url, sizeof(url),
+           "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+           "&current=temperature_2m,weather_code",
+           GRAZ_LAT, GRAZ_LON);
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient http;
+  if (!http.begin(client, url)) return false;
+  http.setUserAgent("CoinDeck/0.3");
+  http.setTimeout(8000);
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("weather HTTP %d\n", code);
+    http.end();
+    return false;
+  }
+  String body = http.getString();
+  http.end();
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) {
+    Serial.println("weather JSON parse error");
+    return false;
+  }
+  weather_temp_c = doc["current"]["temperature_2m"].as<float>();
+  weather_code   = doc["current"]["weather_code"].as<int>();
+  weather_fetched_at = millis();
+  Serial.printf("weather Graz: %.1fC, code %d (%s)\n",
+                weather_temp_c, weather_code, weather_label(weather_code));
+  return true;
+}
+
 static bool fetch_prices() {
   if (WiFi.status() != WL_CONNECTED) return false;
 
@@ -528,6 +650,7 @@ void setup() {
   digitalWrite(TFT_BL, HIGH);
 
   wifi_connect();
+  fetch_weather();
 }
 
 void loop() {
@@ -553,6 +676,11 @@ void loop() {
     Serial.printf("[fetch %lu ok / %lu fail]\n",
                   (unsigned long)(fetch_count - fetch_failed),
                   (unsigned long)fetch_failed);
+  }
+
+  if (millis() - weather_fetched_at > WEATHER_TTL_MS) {
+    fetch_weather();
+    if (current_screen == SCREEN_LIST && grid_ready) redraw_current_screen();
   }
 
   // Per-second clock tick — only redraw the visible frame when the displayed minute would actually change.
@@ -595,11 +723,13 @@ void loop() {
     } else {
       Serial.printf("TAP x=%d y=%d\n", last_x, last_y);
       if (current_screen == SCREEN_LIST) {
-        int picked = -1;
-        if      (last_y >= BTC_Y && last_y < BTC_Y + ROW_HEIGHT) picked = 0;
-        else if (last_y >= ETH_Y && last_y < ETH_Y + ROW_HEIGHT) picked = 1;
-        else if (last_y >= SOL_Y && last_y < SOL_Y + ROW_HEIGHT) picked = 2;
-        if (picked >= 0) goto_detail(picked);
+        if (last_x < LEFT_W) {
+          int picked = -1;
+          if      (last_y >= BTC_Y && last_y < BTC_Y + ROW_HEIGHT) picked = 0;
+          else if (last_y >= ETH_Y && last_y < ETH_Y + ROW_HEIGHT) picked = 1;
+          else if (last_y >= SOL_Y && last_y < SOL_Y + ROW_HEIGHT) picked = 2;
+          if (picked >= 0) goto_detail(picked);
+        }
       } else {
         goto_list();
       }
