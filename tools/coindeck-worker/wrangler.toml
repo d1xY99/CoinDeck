@@ -1,0 +1,9 @@
+name = "coindeck"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# Created with: wrangler kv namespace create CACHE
+# Paste the printed id below.
+[[kv_namespaces]]
+binding = "CACHE"
+id = "53b701250f0348fd9e317b463b4542a3"

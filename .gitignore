@@ -17,3 +17,7 @@ secrets.h
 # Python bytecode (from tools/claude_usage_daemon.py)
 __pycache__/
 *.pyc
+
+# Cloudflare Worker local state
+tools/coindeck-worker/.wrangler/
+tools/coindeck-worker/node_modules/

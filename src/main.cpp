@@ -3,8 +3,6 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include <WebServer.h>
-#include <ESPmDNS.h>
 #include <ArduinoJson.h>
 #include <time.h>
 #include <Arduino_GFX_Library.h>
@@ -195,22 +193,22 @@ static int      weather_code      = -1;   // -1 = unknown
 static uint32_t weather_fetched_at = 0;
 static const uint32_t WEATHER_TTL_MS = 10UL * 60UL * 1000UL;
 
-// --- Claude rate-limit usage (pushed by a 60s daemon on the laptop) ---
-// Pulled from Anthropic API response headers (`anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}`).
+// --- Claude rate-limit usage (pulled from the Cloudflare Worker) ---
+// Worker hits Anthropic /v1/messages with the user's OAuth and surfaces the
+// `anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}` headers.
 static int      claude_session_pct = -1;     // -1 = no data yet
 static int      claude_session_reset_min = 0;
 static int      claude_weekly_pct = -1;
 static int      claude_weekly_reset_min = 0;
 static uint32_t claude_last_update = 0;
 
-static WebServer http_server(8080);
-static const uint32_t CLAUDE_FRESH_MS = 180UL * 1000UL;  // daemon polls every 60s; allow 3x slack
+static const uint32_t CLAUDE_FRESH_MS = 180UL * 1000UL;  // pull every 60s; allow 3x slack
 
 // Clawd idle-breathe animation state (advanced from the loop)
 static uint16_t clawd_frame = 0;
 static uint32_t clawd_frame_started = 0;
 
-// GitHub dashboard state (pushed by tools/github_dashboard_daemon.py)
+// GitHub dashboard state (pulled from the Cloudflare Worker, tools/coindeck-worker/)
 static int      gh_open_prs        = -1;   // -1 = no data
 static int      gh_review_requested = 0;
 static int      gh_ci_passed       = 0;
@@ -228,6 +226,13 @@ static int  gh_review_count = 0;
 static int  gh_issues_assigned = 0;
 static GhPr gh_issues[GH_PR_MAX];
 static int  gh_issue_count = 0;
+
+// Worker poll cadence — must match the cache TTLs on the Worker side.
+static const uint32_t GH_POLL_MS      = 120UL * 1000UL;
+static const uint32_t USAGE_POLL_MS   = 60UL  * 1000UL;
+static const uint32_t REMOTE_RETRY_MS = 15UL  * 1000UL;
+static uint32_t next_gh_poll_at    = 0;
+static uint32_t next_usage_poll_at = 0;
 
 // WMO weather code → short label (matches Open-Meteo's `current.weather_code`).
 static const char *weather_label(int code) {
@@ -1120,6 +1125,84 @@ static bool fetch_prices() {
   return true;
 }
 
+static bool fetch_worker_json(const char *path, JsonDocument &doc) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  char url[256];
+  snprintf(url, sizeof(url), "%s%s", WORKER_BASE_URL, path);
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient http;
+  if (!http.begin(client, url)) return false;
+  http.setUserAgent("CoinDeck/0.3");
+  http.setTimeout(12000);
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("worker %s HTTP %d\n", path, code);
+    http.end();
+    return false;
+  }
+  String body = http.getString();
+  http.end();
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.printf("worker %s JSON: %s\n", path, err.c_str());
+    return false;
+  }
+  return true;
+}
+
+static bool fetch_usage() {
+  JsonDocument doc;
+  if (!fetch_worker_json("/usage", doc)) return false;
+  claude_session_pct       = doc["session_pct"]       | -1;
+  claude_session_reset_min = doc["session_reset_min"] | 0;
+  claude_weekly_pct        = doc["weekly_pct"]        | -1;
+  claude_weekly_reset_min  = doc["weekly_reset_min"]  | 0;
+  claude_last_update = millis();
+  Serial.printf("[claude] 5h=%d%% (reset %dm) | 7d=%d%% (reset %dm)\n",
+                claude_session_pct, claude_session_reset_min,
+                claude_weekly_pct,  claude_weekly_reset_min);
+  if (current_screen == SCREEN_LIST && grid_ready) redraw_current_screen();
+  return true;
+}
+
+static bool fetch_github() {
+  JsonDocument doc;
+  if (!fetch_worker_json("/github", doc)) return false;
+  gh_open_prs         = doc["open_prs"]         | -1;
+  gh_review_requested = doc["review_requested"] | 0;
+  gh_issues_assigned  = doc["issues_assigned"]  | 0;
+  gh_ci_passed        = doc["ci_passed"]        | 0;
+  gh_ci_failed        = doc["ci_failed"]        | 0;
+  gh_ci_pending       = doc["ci_pending"]       | 0;
+  gh_last_update      = millis();
+
+  auto copy_list = [](JsonArray arr, GhPr *dst, int &count) {
+    count = 0;
+    for (JsonObject pr : arr) {
+      if (count >= GH_PR_MAX) break;
+      dst[count].num = pr["n"] | 0;
+      const char *t = pr["t"] | "";
+      strncpy(dst[count].title, t, sizeof(dst[count].title) - 1);
+      dst[count].title[sizeof(dst[count].title) - 1] = 0;
+      count++;
+    }
+  };
+  copy_list(doc["prs"].as<JsonArray>(),     gh_prs,     gh_pr_count);
+  copy_list(doc["reviews"].as<JsonArray>(), gh_reviews, gh_review_count);
+  copy_list(doc["issues"].as<JsonArray>(),  gh_issues,  gh_issue_count);
+
+  Serial.printf("[github] PRs=%d/%d  reviews=%d/%d  issues=%d/%d  ci=%dP/%dF/%d~\n",
+                gh_open_prs, gh_pr_count, gh_review_requested, gh_review_count,
+                gh_issues_assigned, gh_issue_count,
+                gh_ci_passed, gh_ci_failed, gh_ci_pending);
+  if ((current_screen == SCREEN_LIST && current_page == 0) ||
+       current_screen == SCREEN_GITHUB_DETAIL ||
+       current_screen == SCREEN_ISSUES_DETAIL) {
+    redraw_current_screen();
+  }
+  return true;
+}
+
 void setup() {
   Serial.begin(115200);
   delay(2500);
@@ -1145,84 +1228,10 @@ void setup() {
 
   wifi_connect();
   fetch_weather();
-
-  if (MDNS.begin("coindeck")) {
-    MDNS.addService("http", "tcp", 8080);
-    Serial.println("mDNS: coindeck.local on port 8080");
-  } else {
-    Serial.println("mDNS begin failed (will fall back to raw IP).");
-  }
-
-  http_server.on("/usage", HTTP_POST, []() {
-    String body = http_server.arg("plain");
-    JsonDocument doc;
-    if (deserializeJson(doc, body)) {
-      http_server.send(400, "application/json", "{\"ok\":false,\"err\":\"bad json\"}");
-      return;
-    }
-    claude_session_pct       = doc["session_pct"]       | -1;
-    claude_session_reset_min = doc["session_reset_min"] | 0;
-    claude_weekly_pct        = doc["weekly_pct"]        | -1;
-    claude_weekly_reset_min  = doc["weekly_reset_min"]  | 0;
-    claude_last_update = millis();
-    Serial.printf("[claude] 5h=%d%% (reset %dm) | 7d=%d%% (reset %dm)\n",
-                  claude_session_pct, claude_session_reset_min,
-                  claude_weekly_pct,  claude_weekly_reset_min);
-    http_server.send(200, "application/json", "{\"ok\":true}");
-    if (current_screen == SCREEN_LIST && grid_ready) redraw_current_screen();
-  });
-  http_server.on("/github", HTTP_POST, []() {
-    String body = http_server.arg("plain");
-    JsonDocument doc;
-    if (deserializeJson(doc, body)) {
-      http_server.send(400, "application/json", "{\"ok\":false,\"err\":\"bad json\"}");
-      return;
-    }
-    gh_open_prs         = doc["open_prs"]         | -1;
-    gh_review_requested = doc["review_requested"] | 0;
-    gh_issues_assigned  = doc["issues_assigned"]  | 0;
-    gh_ci_passed        = doc["ci_passed"]        | 0;
-    gh_ci_failed        = doc["ci_failed"]        | 0;
-    gh_ci_pending       = doc["ci_pending"]       | 0;
-    gh_last_update      = millis();
-
-    auto copy_list = [](JsonArray arr, GhPr *dst, int &count) {
-      count = 0;
-      for (JsonObject pr : arr) {
-        if (count >= GH_PR_MAX) break;
-        dst[count].num = pr["n"] | 0;
-        const char *t = pr["t"] | "";
-        strncpy(dst[count].title, t, sizeof(dst[count].title) - 1);
-        dst[count].title[sizeof(dst[count].title) - 1] = 0;
-        count++;
-      }
-    };
-    copy_list(doc["prs"].as<JsonArray>(),     gh_prs,     gh_pr_count);
-    copy_list(doc["reviews"].as<JsonArray>(), gh_reviews, gh_review_count);
-    copy_list(doc["issues"].as<JsonArray>(),  gh_issues,  gh_issue_count);
-
-    Serial.printf("[github] PRs=%d/%d  reviews=%d/%d  issues=%d/%d  ci=%dP/%dF/%d~\n",
-                  gh_open_prs, gh_pr_count, gh_review_requested, gh_review_count,
-                  gh_issues_assigned, gh_issue_count,
-                  gh_ci_passed, gh_ci_failed, gh_ci_pending);
-    http_server.send(200, "application/json", "{\"ok\":true}");
-    if ((current_screen == SCREEN_LIST && current_page == 0) ||
-         current_screen == SCREEN_GITHUB_DETAIL) {
-      redraw_current_screen();
-    }
-  });
-  http_server.on("/", HTTP_GET, []() {
-    http_server.send(200, "text/plain",
-                     "CoinDeck. POST /usage (Claude) or /github (dashboard).");
-  });
-  http_server.begin();
-  Serial.printf("HTTP server up on %s:8080\n", WiFi.localIP().toString().c_str());
 }
 
 void loop() {
   static uint32_t last_footer_tick = 0;
-
-  http_server.handleClient();
 
   // Advance the Clawd animation frame when its hold time elapses.
   if (millis() - clawd_frame_started >= splash_idle_breathe_holds[clawd_frame]) {
@@ -1256,6 +1265,13 @@ void loop() {
   if (millis() - weather_fetched_at > WEATHER_TTL_MS) {
     fetch_weather();
     if (current_screen == SCREEN_LIST && grid_ready) redraw_current_screen();
+  }
+
+  if ((int32_t)(millis() - next_gh_poll_at) >= 0) {
+    next_gh_poll_at = millis() + (fetch_github() ? GH_POLL_MS : REMOTE_RETRY_MS);
+  }
+  if ((int32_t)(millis() - next_usage_poll_at) >= 0) {
+    next_usage_poll_at = millis() + (fetch_usage() ? USAGE_POLL_MS : REMOTE_RETRY_MS);
   }
 
   // Per-second clock tick — only redraw the visible frame when the displayed minute would actually change.
