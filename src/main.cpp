@@ -3,11 +3,14 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 #include <ArduinoJson.h>
 #include <time.h>
 #include <Arduino_GFX_Library.h>
 
 #include "secrets.h"
+#include "clawd_sprite.h"
 
 // --- JC3248W535 (Sunton/Guition) display + touch pinout ---
 #define TFT_BL    1
@@ -164,6 +167,21 @@ static int      weather_code      = -1;   // -1 = unknown
 static uint32_t weather_fetched_at = 0;
 static const uint32_t WEATHER_TTL_MS = 10UL * 60UL * 1000UL;
 
+// --- Claude rate-limit usage (pushed by a 60s daemon on the laptop) ---
+// Pulled from Anthropic API response headers (`anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}`).
+static int      claude_session_pct = -1;     // -1 = no data yet
+static int      claude_session_reset_min = 0;
+static int      claude_weekly_pct = -1;
+static int      claude_weekly_reset_min = 0;
+static uint32_t claude_last_update = 0;
+
+static WebServer http_server(8080);
+static const uint32_t CLAUDE_FRESH_MS = 180UL * 1000UL;  // daemon polls every 60s; allow 3x slack
+
+// Clawd idle-breathe animation state (advanced from the loop)
+static uint16_t clawd_frame = 0;
+static uint32_t clawd_frame_started = 0;
+
 // WMO weather code → short label (matches Open-Meteo's `current.weather_code`).
 static const char *weather_label(int code) {
   if (code == 0)            return "clear";
@@ -290,22 +308,93 @@ static void draw_right_column() {
   // Horizontal divider above Claude box
   gfx->drawFastHLine(rx + 4, CLAUDE_Y, RIGHT_W - 8, COL_DIM);
 
-  // Claude session placeholder — will be wired to a Claude Code hook later.
+  // Title + live/stale indicator
   gfx->setTextSize(2);
   gfx->setTextColor(COL_TITLE);
   const char *claude_title = "Claude";
-  gfx->setCursor(rcenter - text_width(claude_title, 2) / 2, CLAUDE_Y + 10);
+  gfx->setCursor(rcenter - text_width(claude_title, 2) / 2, CLAUDE_Y + 6);
   gfx->print(claude_title);
 
-  gfx->setTextSize(1);
-  gfx->setTextColor(COL_DIM);
-  const char *sub = "session";
-  gfx->setCursor(rcenter - text_width(sub, 1) / 2, CLAUDE_Y + 34);
-  gfx->print(sub);
+  bool has_data = claude_last_update != 0;
+  bool live     = has_data && (millis() - claude_last_update < CLAUDE_FRESH_MS);
+  uint16_t dot_color = !has_data ? COL_DIM : live ? COL_OK : COL_WARN;
+  gfx->fillCircle(rcenter - text_width(claude_title, 2) / 2 - 10, CLAUDE_Y + 14, 4, dot_color);
 
-  gfx->setTextColor(COL_DIM);
-  gfx->setCursor(rcenter - text_width("waiting...", 1) / 2, CLAUDE_Y + 80);
-  gfx->print("waiting...");
+  if (!has_data || claude_session_pct < 0) {
+    gfx->setTextSize(1);
+    gfx->setTextColor(COL_DIM);
+    gfx->setCursor(rcenter - text_width("waiting...", 1) / 2, CLAUDE_Y + 50);
+    gfx->print("waiting...");
+    return;
+  }
+
+  const int bar_x = DIVIDER_X + 8;
+  const int bar_w = RIGHT_W - 16;
+  const int bar_h = 14;
+
+  auto fmt_reset = [](char *out, size_t cap, int minutes) {
+    if (minutes <= 0)          snprintf(out, cap, "now");
+    else if (minutes < 60)     snprintf(out, cap, "in %dm", minutes);
+    else if (minutes < 60*24) {
+      int h = minutes / 60, m = minutes % 60;
+      if (m == 0) snprintf(out, cap, "in %dh", h);
+      else        snprintf(out, cap, "in %dh %dm", h, m);
+    } else {
+      int d = minutes / (60*24), h = (minutes % (60*24)) / 60;
+      if (h == 0) snprintf(out, cap, "in %dd", d);
+      else        snprintf(out, cap, "in %dd %dh", d, h);
+    }
+  };
+  auto bar_color = [](int pct) -> uint16_t {
+    if (pct < 60)  return COL_OK;
+    if (pct < 85)  return COL_WARN;
+    return COL_ERR;
+  };
+
+  auto draw_bar = [&](int y, const char *label, int pct, int reset_min) {
+    char pct_buf[8];
+    snprintf(pct_buf, sizeof(pct_buf), "%d%%", pct);
+    gfx->setTextSize(2);
+    gfx->setTextColor(COL_DIM);
+    gfx->setCursor(bar_x, y);
+    gfx->print(label);
+    gfx->setTextColor(COL_TITLE);
+    gfx->setCursor(DIVIDER_X + RIGHT_W - 8 - text_width(pct_buf, 2), y);
+    gfx->print(pct_buf);
+
+    int bary = y + 20;
+    gfx->drawRect(bar_x, bary, bar_w, bar_h, COL_DIM);
+    int fill_w = (bar_w - 2) * pct / 100;
+    if (fill_w > 0) gfx->fillRect(bar_x + 1, bary + 1, fill_w, bar_h - 2, bar_color(pct));
+
+    char reset_buf[24], reset_line[40];
+    fmt_reset(reset_buf, sizeof(reset_buf), reset_min);
+    snprintf(reset_line, sizeof(reset_line), "Resets %s", reset_buf);
+    gfx->setTextSize(1);
+    gfx->setTextColor(COL_DIM);
+    gfx->setCursor(bar_x, bary + bar_h + 4);
+    gfx->print(reset_line);
+  };
+
+  draw_bar(CLAUDE_Y + 28,  "5h",   claude_session_pct, claude_session_reset_min);
+  draw_bar(CLAUDE_Y + 80,  "Week", claude_weekly_pct,  claude_weekly_reset_min);
+
+  // Clawd sprite (20x20 scaled 2x = 40x40) bouncing at the bottom of the box.
+  const int sprite_scale = 2;
+  const int sw = CLAWD_W * sprite_scale;
+  const int sh = CLAWD_H * sprite_scale;
+  const int sx0 = rcenter - sw / 2;
+  const int sy0 = LCD_H - sh - 4;
+  const uint8_t *frame = splash_idle_breathe_frames[clawd_frame];
+  for (int py = 0; py < CLAWD_H; py++) {
+    for (int px = 0; px < CLAWD_W; px++) {
+      uint8_t idx = frame[py * CLAWD_W + px];
+      if (idx == 0) continue;  // transparent
+      uint16_t col = splash_idle_breathe_palette[idx];
+      gfx->fillRect(sx0 + px * sprite_scale, sy0 + py * sprite_scale,
+                    sprite_scale, sprite_scale, col);
+    }
+  }
 }
 
 static void draw_footer_into_canvas() {
@@ -651,10 +740,51 @@ void setup() {
 
   wifi_connect();
   fetch_weather();
+
+  if (MDNS.begin("coindeck")) {
+    MDNS.addService("http", "tcp", 8080);
+    Serial.println("mDNS: coindeck.local on port 8080");
+  } else {
+    Serial.println("mDNS begin failed (will fall back to raw IP).");
+  }
+
+  http_server.on("/usage", HTTP_POST, []() {
+    String body = http_server.arg("plain");
+    JsonDocument doc;
+    if (deserializeJson(doc, body)) {
+      http_server.send(400, "application/json", "{\"ok\":false,\"err\":\"bad json\"}");
+      return;
+    }
+    claude_session_pct       = doc["session_pct"]       | -1;
+    claude_session_reset_min = doc["session_reset_min"] | 0;
+    claude_weekly_pct        = doc["weekly_pct"]        | -1;
+    claude_weekly_reset_min  = doc["weekly_reset_min"]  | 0;
+    claude_last_update = millis();
+    Serial.printf("[claude] 5h=%d%% (reset %dm) | 7d=%d%% (reset %dm)\n",
+                  claude_session_pct, claude_session_reset_min,
+                  claude_weekly_pct,  claude_weekly_reset_min);
+    http_server.send(200, "application/json", "{\"ok\":true}");
+    if (current_screen == SCREEN_LIST && grid_ready) redraw_current_screen();
+  });
+  http_server.on("/", HTTP_GET, []() {
+    http_server.send(200, "text/plain",
+                     "CoinDeck up. POST /usage with {session_pct, session_reset_min, weekly_pct, weekly_reset_min}.");
+  });
+  http_server.begin();
+  Serial.printf("HTTP server up on %s:8080\n", WiFi.localIP().toString().c_str());
 }
 
 void loop() {
   static uint32_t last_footer_tick = 0;
+
+  http_server.handleClient();
+
+  // Advance the Clawd animation frame when its hold time elapses.
+  if (millis() - clawd_frame_started >= splash_idle_breathe_holds[clawd_frame]) {
+    clawd_frame = (clawd_frame + 1) % CLAWD_FRAMES;
+    clawd_frame_started = millis();
+    if (current_screen == SCREEN_LIST && grid_ready) redraw_current_screen();
+  }
 
   if (WiFi.status() != WL_CONNECTED) {
     grid_ready = false;

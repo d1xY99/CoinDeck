@@ -1,0 +1,15 @@
+[Unit]
+Description=CoinDeck Claude usage daemon (push rate-limit % to ESP32)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/Desktop/amoled-project/CoinDeck/tools/claude_usage_daemon.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:%h/.local/state/claude-coindeck.log
+StandardError=append:%h/.local/state/claude-coindeck.log
+
+[Install]
+WantedBy=default.target

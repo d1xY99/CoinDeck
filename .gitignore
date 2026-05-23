@@ -13,3 +13,7 @@ secrets.h
 .DS_Store
 *.swp
 *~
+
+# Python bytecode (from tools/claude_usage_daemon.py)
+__pycache__/
+*.pyc
