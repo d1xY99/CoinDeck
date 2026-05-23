@@ -71,6 +71,10 @@ enum Screen { SCREEN_LIST, SCREEN_DETAIL };
 static Screen current_screen = SCREEN_LIST;
 static int    current_coin   = 0;
 
+// Top-level pages on SCREEN_LIST — bump PAGE_COUNT to add more.
+static const int PAGE_COUNT = 2;
+static int current_page = 0;
+
 static const int CHART_POINTS = 64;
 struct ChartData {
   float    points[CHART_POINTS];
@@ -85,6 +89,7 @@ static const char *TZ_BOSNIA = "CET-1CEST,M3.5.0/2,M10.5.0/3";
 static bool format_time(char *out, size_t cap);
 static void ensure_chart_fresh(int coin_idx);
 static void draw_chart(int coin_idx);
+static void draw_page_indicator_at(int y_center);
 
 static const char *COINGECKO_URL =
     "https://api.coingecko.com/api/v3/simple/price"
@@ -419,6 +424,7 @@ static void draw_grid() {
   draw_coin_row(SOL_Y, "SOL", COL_SOL, sol);
   draw_footer_into_canvas();
   draw_right_column();
+  draw_page_indicator_at(FOOTER_Y + 12);
   gfx->flush();
   grid_ready = true;
 }
@@ -586,9 +592,45 @@ static void draw_detail() {
   gfx->flush();
 }
 
+static void draw_page_indicator_at(int y_center) {
+  const int dot_r   = 3;
+  const int gap     = 12;
+  const int total_w = PAGE_COUNT * (dot_r * 2) + (PAGE_COUNT - 1) * gap;
+  const int x0      = (LCD_W - total_w) / 2;
+  for (int i = 0; i < PAGE_COUNT; i++) {
+    int cx = x0 + i * (dot_r * 2 + gap) + dot_r;
+    if (i == current_page) gfx->fillCircle(cx, y_center, dot_r, COL_TITLE);
+    else                   gfx->drawCircle(cx, y_center, dot_r, COL_DIM);
+  }
+}
+
+static void draw_page2() {
+  gfx->fillScreen(COL_BG);
+
+  gfx->setTextSize(4);
+  gfx->setTextColor(COL_TITLE);
+  const char *t = "Page 2";
+  gfx->setCursor((LCD_W - text_width(t, 4)) / 2, 100);
+  gfx->print(t);
+
+  gfx->setTextSize(1);
+  gfx->setTextColor(COL_DIM);
+  const char *hint1 = "more widgets go here";
+  const char *hint2 = "swipe right to go back";
+  gfx->setCursor((LCD_W - text_width(hint1, 1)) / 2, 160);
+  gfx->print(hint1);
+  gfx->setCursor((LCD_W - text_width(hint2, 1)) / 2, 178);
+  gfx->print(hint2);
+
+  draw_page_indicator_at(FOOTER_Y + 12);
+  gfx->flush();
+  grid_ready = true;
+}
+
 static void redraw_current_screen() {
-  if (current_screen == SCREEN_LIST) draw_grid();
-  else                                draw_detail();
+  if (current_screen == SCREEN_DETAIL) { draw_detail(); return; }
+  if (current_page == 0) draw_grid();
+  else                   draw_page2();
 }
 
 static void goto_list() {
@@ -849,11 +891,18 @@ void loop() {
       Serial.printf("SWIPE dx=%d dir=%+d\n", dx, dir);
       if (current_screen == SCREEN_DETAIL) {
         goto_detail(current_coin + (dir > 0 ? -1 : +1));
+      } else {
+        // SCREEN_LIST: swipe-left → next page, swipe-right → previous.
+        int next = current_page + (dir > 0 ? -1 : +1);
+        if (next >= 0 && next < PAGE_COUNT && next != current_page) {
+          current_page = next;
+          redraw_current_screen();
+        }
       }
     } else {
       Serial.printf("TAP x=%d y=%d\n", last_x, last_y);
       if (current_screen == SCREEN_LIST) {
-        if (last_x < LEFT_W) {
+        if (current_page == 0 && last_x < LEFT_W) {
           int picked = -1;
           if      (last_y >= BTC_Y && last_y < BTC_Y + ROW_HEIGHT) picked = 0;
           else if (last_y >= ETH_Y && last_y < ETH_Y + ROW_HEIGHT) picked = 1;
