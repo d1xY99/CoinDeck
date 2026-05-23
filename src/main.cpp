@@ -3,6 +3,8 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <WiFiManager.h>
+#include <Preferences.h>
 #include <ArduinoJson.h>
 #include <time.h>
 #include <Arduino_GFX_Library.h>
@@ -71,9 +73,34 @@ static uint32_t fetch_count    = 0;
 static uint32_t fetch_failed   = 0;
 static bool     grid_ready     = false;
 
-enum Screen { SCREEN_LIST, SCREEN_DETAIL, SCREEN_GITHUB_DETAIL, SCREEN_ISSUES_DETAIL };
+enum Screen {
+  SCREEN_LIST,
+  SCREEN_DETAIL,
+  SCREEN_GITHUB_DETAIL,
+  SCREEN_ISSUES_DETAIL,
+  SCREEN_WIFI_SCAN,
+  SCREEN_WIFI_KEY,
+};
 static Screen current_screen = SCREEN_LIST;
 static int    current_coin   = 0;
+
+// --- On-screen WiFi setup ---
+struct WifiNet { char ssid[33]; int rssi; bool open; };
+static const int WIFI_LIST_MAX = 10;
+static WifiNet wifi_list[WIFI_LIST_MAX];
+static int     wifi_list_count = 0;
+static bool    wifi_scan_busy  = false;
+
+static char wifi_pick_ssid[33] = "";
+static char wifi_pass_buf[64]  = "";
+static int  wifi_pass_len      = 0;
+static bool wifi_caps_on       = false;
+static const char *wifi_status_msg = "";   // shown above keyboard for errors / hints
+
+// Last-known good creds — populated by WiFiManager on initial boot, by the
+// on-screen keyboard on successful connect. Used for silent loop reconnects.
+static String saved_ssid;
+static String saved_pass;
 
 // Y bounds of the "Issues" section inside the GitHub detail screen, captured
 // during render so the touch handler can tell when a tap lands on it.
@@ -81,7 +108,10 @@ static int gh_issues_band_top = -1;
 static int gh_issues_band_bot = -1;
 
 // Top-level pages on SCREEN_LIST — bump PAGE_COUNT to add more.
-static const int PAGE_COUNT = 2;
+//   0 = GitHub box + weather/clock/Claude widgets
+//   1 = CoinDeck full-screen (5 coins)
+//   2 = WiFi info + on-demand setup portal
+static const int PAGE_COUNT = 3;
 static int current_page = 0;
 
 static const int CHART_POINTS = 64;
@@ -977,12 +1007,294 @@ static void draw_issues_detail() {
   gfx->flush();
 }
 
+static void draw_page_wifi();
+static void draw_wifi_scan();
+static void draw_wifi_key();
+static void ntp_begin();
+static bool fetch_weather();
+static void wifi_save_creds(const char *ssid, const char *pass);
+
 static void redraw_current_screen() {
   if (current_screen == SCREEN_DETAIL)         { draw_detail();         return; }
   if (current_screen == SCREEN_GITHUB_DETAIL)  { draw_github_detail();  return; }
   if (current_screen == SCREEN_ISSUES_DETAIL)  { draw_issues_detail();  return; }
-  if (current_page == 0) draw_page2();
-  else                   draw_page_crypto();
+  if (current_screen == SCREEN_WIFI_SCAN)      { draw_wifi_scan();      return; }
+  if (current_screen == SCREEN_WIFI_KEY)       { draw_wifi_key();       return; }
+  if (current_page == 0)      draw_page2();
+  else if (current_page == 1) draw_page_crypto();
+  else                        draw_page_wifi();
+}
+
+static void draw_page_wifi() {
+  gfx->fillScreen(COL_BG);
+
+  gfx->setTextSize(3);
+  gfx->setTextColor(COL_TITLE);
+  const char *title = "WiFi";
+  gfx->setCursor((LCD_W - text_width(title, 3)) / 2, 18);
+  gfx->print(title);
+
+  bool up = WiFi.status() == WL_CONNECTED;
+
+  gfx->setTextSize(2);
+  gfx->setTextColor(COL_DIM); gfx->setCursor(40, 75);  gfx->print("SSID:");
+  gfx->setTextColor(up ? COL_OK : COL_ERR);
+  gfx->setCursor(140, 75);
+  gfx->print(up ? WiFi.SSID().c_str() : "not connected");
+
+  if (up) {
+    gfx->setTextColor(COL_DIM); gfx->setCursor(40, 110); gfx->print("IP:");
+    gfx->setTextColor(COL_TITLE); gfx->setCursor(140, 110);
+    gfx->print(WiFi.localIP().toString().c_str());
+
+    gfx->setTextColor(COL_DIM); gfx->setCursor(40, 145); gfx->print("RSSI:");
+    gfx->setTextColor(COL_TITLE); gfx->setCursor(140, 145);
+    gfx->printf("%d dBm", (int)WiFi.RSSI());
+  }
+
+  const int bw = 360, bh = 56;
+  const int bx = (LCD_W - bw) / 2, by = 205;
+  gfx->fillRoundRect(bx, by, bw, bh, 10, COL_WARN);
+  gfx->setTextColor(COL_BG);
+  const char *btn = "Tap to switch WiFi";
+  gfx->setCursor(bx + (bw - text_width(btn, 2)) / 2, by + 20);
+  gfx->print(btn);
+
+  draw_page_indicator_at(FOOTER_Y + 12);
+  gfx->flush();
+}
+
+// --- On-screen WiFi setup: scan + soft keyboard ----------------------------
+
+static void wifi_do_scan() {
+  wifi_scan_busy  = true;
+  wifi_list_count = 0;
+  redraw_current_screen();
+
+  WiFi.mode(WIFI_STA);
+  int n = WiFi.scanNetworks();
+  if (n < 0) n = 0;
+  if (n > 64) n = 64;
+
+  // Sort indices by RSSI desc.
+  int idx[64];
+  for (int i = 0; i < n; i++) idx[i] = i;
+  for (int i = 0; i < n; i++)
+    for (int j = i + 1; j < n; j++)
+      if (WiFi.RSSI(idx[j]) > WiFi.RSSI(idx[i])) { int t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
+
+  int taken = n < WIFI_LIST_MAX ? n : WIFI_LIST_MAX;
+  for (int i = 0; i < taken; i++) {
+    int k = idx[i];
+    strncpy(wifi_list[i].ssid, WiFi.SSID(k).c_str(), sizeof(wifi_list[i].ssid) - 1);
+    wifi_list[i].ssid[sizeof(wifi_list[i].ssid) - 1] = 0;
+    wifi_list[i].rssi = WiFi.RSSI(k);
+    wifi_list[i].open = WiFi.encryptionType(k) == WIFI_AUTH_OPEN;
+  }
+  wifi_list_count = taken;
+  WiFi.scanDelete();
+  wifi_scan_busy = false;
+}
+
+static void draw_wifi_scan() {
+  gfx->fillScreen(COL_BG);
+
+  gfx->setTextSize(2);
+  gfx->setTextColor(COL_TITLE);
+  gfx->setCursor(8, 8);
+  gfx->print("Pick a network");
+
+  gfx->setTextSize(1);
+  gfx->setTextColor(COL_DIM);
+  const char *back = "tap empty area to cancel";
+  gfx->setCursor(LCD_W - text_width(back, 1) - 8, 14);
+  gfx->print(back);
+
+  if (wifi_scan_busy) {
+    gfx->setTextSize(2);
+    gfx->setTextColor(COL_WARN);
+    const char *m = "Scanning...";
+    gfx->setCursor((LCD_W - text_width(m, 2)) / 2, LCD_H / 2 - 8);
+    gfx->print(m);
+  } else if (wifi_list_count == 0) {
+    gfx->setTextSize(2);
+    gfx->setTextColor(COL_DIM);
+    const char *m = "No networks found";
+    gfx->setCursor((LCD_W - text_width(m, 2)) / 2, LCD_H / 2 - 8);
+    gfx->print(m);
+  } else {
+    const int row_h = 26;
+    int y = 40;
+    for (int i = 0; i < wifi_list_count; i++) {
+      char buf[34];
+      strncpy(buf, wifi_list[i].ssid, sizeof(buf) - 1);
+      buf[sizeof(buf) - 1] = 0;
+      while (strlen(buf) > 0 && text_width(buf, 2) > LCD_W - 130) buf[strlen(buf) - 1] = 0;
+
+      gfx->setTextSize(2);
+      gfx->setTextColor(COL_TITLE);
+      gfx->setCursor(8, y);
+      gfx->print(buf);
+
+      gfx->setTextSize(1);
+      uint16_t col = wifi_list[i].rssi > -60 ? COL_OK
+                   : wifi_list[i].rssi > -75 ? COL_WARN : COL_ERR;
+      gfx->setTextColor(col);
+      char rb[20];
+      snprintf(rb, sizeof(rb), "%ddBm%s", wifi_list[i].rssi, wifi_list[i].open ? " open" : "");
+      int w = text_width(rb, 1);
+      gfx->setCursor(LCD_W - w - 8, y + 5);
+      gfx->print(rb);
+
+      y += row_h;
+      if (y > LCD_H - row_h) break;
+    }
+  }
+  gfx->flush();
+}
+
+static void draw_key(int x, int y, int w, int h, const char *label, uint16_t bg, uint16_t fg) {
+  gfx->fillRoundRect(x + 1, y + 1, w - 2, h - 2, 4, bg);
+  gfx->setTextSize(2);
+  gfx->setTextColor(fg);
+  int lw = text_width(label, 2);
+  gfx->setCursor(x + (w - lw) / 2, y + (h - 16) / 2);
+  gfx->print(label);
+}
+
+// Keyboard layout (480x320, rows below y=80):
+//   Row 0 [80,128):  1234567890     (10 keys @ 48)
+//   Row 1 [128,176): qwertyuiop
+//   Row 2 [176,224): asdfghjkl      (9 keys, x offset 24)
+//   Row 3 [224,272): SHIFT z x c v b n m DEL
+//   Row 4 [272,320): CANCEL  SPACE  OK
+static void draw_wifi_key() {
+  gfx->fillScreen(COL_BG);
+
+  gfx->setTextSize(2);
+  gfx->setTextColor(COL_DIM);  gfx->setCursor(8, 6);  gfx->print("SSID:");
+  gfx->setTextColor(COL_OK);   gfx->setCursor(80, 6); gfx->print(wifi_pick_ssid);
+
+  gfx->setTextColor(COL_DIM);  gfx->setCursor(8, 34); gfx->print("Pass:");
+  gfx->setCursor(80, 34);
+  if (wifi_pass_len == 0) {
+    gfx->setTextColor(COL_DIM); gfx->print("(tap keys)");
+  } else {
+    gfx->setTextColor(COL_TITLE);
+    gfx->print(wifi_pass_buf);
+  }
+
+  if (wifi_status_msg[0]) {
+    gfx->setTextSize(1);
+    gfx->setTextColor(COL_WARN);
+    gfx->setCursor(8, 60);
+    gfx->print(wifi_status_msg);
+  }
+
+  const char *r0 = "1234567890";
+  for (int i = 0; i < 10; i++) {
+    char s[2] = { r0[i], 0 };
+    draw_key(i * 48, 80, 48, 48, s, COL_DIM, COL_TITLE);
+  }
+  const char *r1 = "qwertyuiop";
+  for (int i = 0; i < 10; i++) {
+    char s[2] = { (char)(wifi_caps_on ? r1[i] - 32 : r1[i]), 0 };
+    draw_key(i * 48, 128, 48, 48, s, COL_DIM, COL_TITLE);
+  }
+  const char *r2 = "asdfghjkl";
+  for (int i = 0; i < 9; i++) {
+    char s[2] = { (char)(wifi_caps_on ? r2[i] - 32 : r2[i]), 0 };
+    draw_key(24 + i * 48, 176, 48, 48, s, COL_DIM, COL_TITLE);
+  }
+  draw_key(0, 224, 72, 48, "^", wifi_caps_on ? COL_WARN : COL_DIM, COL_TITLE);
+  const char *r3 = "zxcvbnm";
+  for (int i = 0; i < 7; i++) {
+    char s[2] = { (char)(wifi_caps_on ? r3[i] - 32 : r3[i]), 0 };
+    draw_key(72 + i * 48, 224, 48, 48, s, COL_DIM, COL_TITLE);
+  }
+  draw_key(408, 224, 72, 48, "DEL", COL_DIM, COL_TITLE);
+  draw_key(0,   272, 96, 48, "CANCEL", COL_ERR, COL_TITLE);
+  draw_key(96,  272, 288, 48, "space", COL_DIM, COL_TITLE);
+  draw_key(384, 272, 96, 48, "OK",  COL_OK,  COL_BG);
+
+  gfx->flush();
+}
+
+// Returns ASCII for letter/digit, or one of:
+//   -2 SHIFT, -3 DEL, -4 SPACE, -5 OK, -6 CANCEL, -1 miss.
+static int key_at(int x, int y) {
+  if (y < 80 || y >= 320) return -1;
+  if (y < 128) {
+    int c = x / 48; if (c < 0 || c > 9) return -1;
+    return "1234567890"[c];
+  }
+  if (y < 176) {
+    int c = x / 48; if (c < 0 || c > 9) return -1;
+    char k = "qwertyuiop"[c]; return wifi_caps_on ? k - 32 : k;
+  }
+  if (y < 224) {
+    if (x < 24 || x >= 24 + 9 * 48) return -1;
+    char k = "asdfghjkl"[(x - 24) / 48];
+    return wifi_caps_on ? k - 32 : k;
+  }
+  if (y < 272) {
+    if (x < 72)   return -2;
+    if (x >= 408) return -3;
+    int c = (x - 72) / 48; if (c < 0 || c > 6) return -1;
+    char k = "zxcvbnm"[c]; return wifi_caps_on ? k - 32 : k;
+  }
+  if (x < 96)  return -6;
+  if (x >= 384) return -5;
+  return -4;
+}
+
+static void goto_wifi_scan() {
+  current_screen = SCREEN_WIFI_SCAN;
+  wifi_status_msg = "";
+  wifi_do_scan();
+  redraw_current_screen();
+}
+
+static void goto_wifi_key(const char *ssid) {
+  strncpy(wifi_pick_ssid, ssid, sizeof(wifi_pick_ssid) - 1);
+  wifi_pick_ssid[sizeof(wifi_pick_ssid) - 1] = 0;
+  wifi_pass_buf[0] = 0;
+  wifi_pass_len   = 0;
+  wifi_caps_on    = false;
+  wifi_status_msg = "";
+  current_screen  = SCREEN_WIFI_KEY;
+  redraw_current_screen();
+}
+
+static void wifi_try_connect_from_key() {
+  wifi_status_msg = "Connecting...";
+  redraw_current_screen();
+
+  WiFi.disconnect(false, false);
+  delay(150);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifi_pick_ssid, wifi_pass_buf);
+
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) delay(200);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    saved_ssid = wifi_pick_ssid;
+    saved_pass = wifi_pass_buf;
+    wifi_save_creds(wifi_pick_ssid, wifi_pass_buf);
+    Serial.printf("WiFi OK (on-screen). IP=%s SSID=%s\n",
+                  WiFi.localIP().toString().c_str(), wifi_pick_ssid);
+    ntp_begin();
+    fetch_weather();
+    current_screen = SCREEN_LIST;
+    current_page   = 2;
+    redraw_current_screen();
+  } else {
+    wifi_status_msg = "Failed. Wrong pass?";
+    wifi_pass_len   = 0;
+    wifi_pass_buf[0] = 0;
+    redraw_current_screen();
+  }
 }
 
 static void goto_list() {
@@ -1024,29 +1336,95 @@ static bool format_time(char *out, size_t cap) {
   return true;
 }
 
-static bool wifi_connect(uint32_t timeout_ms = 20000) {
+// Persist WiFi creds in our own NVS namespace — independent of WiFiManager's
+// storage so the same saved value is found whether the creds came from the
+// portal or the on-screen soft keyboard.
+static void wifi_save_creds(const char *ssid, const char *pass) {
+  Preferences p;
+  if (!p.begin("coindeck", false)) return;
+  p.putString("ssid", ssid);
+  p.putString("pass", pass);
+  p.end();
+}
+
+static bool wifi_load_creds(String &ssid, String &pass) {
+  Preferences p;
+  if (!p.begin("coindeck", true)) return false;
+  ssid = p.getString("ssid", "");
+  pass = p.getString("pass", "");
+  p.end();
+  return ssid.length() > 0;
+}
+
+static void wifi_portal_screen(WiFiManager *) {
+  digitalWrite(TFT_BL, HIGH);
+  gfx->fillScreen(COL_BG);
+  gfx->setTextSize(3);
+  gfx->setTextColor(COL_WARN);
+  gfx->setCursor(20, 25);
+  gfx->print("WiFi setup");
+
+  gfx->setTextSize(2);
+  gfx->setTextColor(COL_TITLE);
+  gfx->setCursor(20, 85);
+  gfx->print("1. Phone -> WiFi:");
+  gfx->setTextColor(COL_OK);
+  gfx->setCursor(20, 115);
+  gfx->print("   CoinDeck-Setup");
+
+  gfx->setTextColor(COL_TITLE);
+  gfx->setCursor(20, 160);
+  gfx->print("2. Open browser:");
+  gfx->setTextColor(COL_OK);
+  gfx->setCursor(20, 190);
+  gfx->print("   http://192.168.4.1");
+  gfx->setTextColor(COL_DIM);
+  gfx->setCursor(20, 215);
+  gfx->print("   (auto-opens on most");
+  gfx->setCursor(20, 235);
+  gfx->print("    Androids; iOS may");
+  gfx->setCursor(20, 255);
+  gfx->print("    need manual visit)");
+
+  gfx->setTextSize(1);
+  gfx->setCursor(20, 285);
+  gfx->print("Times out after 3 min.");
+  gfx->flush();
+}
+
+// allow_portal=true on first boot or when saved creds fail: opens AP captive
+// portal. allow_portal=false in the loop reconnect path so a brief WiFi blip
+// doesn't kick the user out of CoinDeck into setup mode.
+static bool wifi_connect(bool allow_portal) {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   status_line(150, COL_WARN, "connecting wifi...");
-  Serial.printf("Connecting to '%s'", WIFI_SSID);
 
-  uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < timeout_ms) {
-    delay(300);
-    Serial.print('.');
-  }
-  Serial.println();
+  String s, p;
+  if (saved_ssid.length() == 0) wifi_load_creds(saved_ssid, saved_pass);
 
-  if (WiFi.status() != WL_CONNECTED) {
-    status_line(150, COL_ERR, "wifi FAILED");
-    return false;
+  if (saved_ssid.length() > 0) {
+    WiFi.begin(saved_ssid.c_str(), saved_pass.c_str());
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) delay(200);
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("WiFi OK. IP=%s SSID=%s RSSI=%d dBm\n",
+                    WiFi.localIP().toString().c_str(),
+                    WiFi.SSID().c_str(), (int)WiFi.RSSI());
+      ntp_begin();
+      return true;
+    }
   }
-  Serial.printf("WiFi OK. IP=%s, RSSI=%d dBm\n",
-                WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
-  ntp_begin();
-  return true;
+
+  if (!allow_portal) return false;
+
+  // No saved creds, or saved network out of range — drop into the on-screen
+  // scan + keyboard. Loop drives the rest; nothing else in setup() depends on
+  // WiFi being up.
+  Serial.println("No usable saved WiFi — entering on-screen setup.");
+  goto_wifi_scan();
+  return false;
 }
 
 static bool fetch_weather() {
@@ -1226,7 +1604,7 @@ void setup() {
   gfx->flush();
   digitalWrite(TFT_BL, HIGH);
 
-  wifi_connect();
+  wifi_connect(true);
   fetch_weather();
 }
 
@@ -1240,10 +1618,12 @@ void loop() {
     if (current_screen == SCREEN_LIST && grid_ready) redraw_current_screen();
   }
 
-  if (WiFi.status() != WL_CONNECTED) {
+  if (WiFi.status() != WL_CONNECTED
+      && current_screen != SCREEN_WIFI_SCAN
+      && current_screen != SCREEN_WIFI_KEY) {
     grid_ready = false;
     status_line(150, COL_WARN, "wifi lost, retry");
-    wifi_connect();
+    wifi_connect(false);
   }
 
   if ((int32_t)(millis() - next_fetch_at) >= 0) {
@@ -1275,7 +1655,9 @@ void loop() {
   }
 
   // Per-second clock tick — only redraw the visible frame when the displayed minute would actually change.
-  if (grid_ready && millis() - last_footer_tick > 1000) {
+  // Skip during the WiFi setup screens so the keyboard / scan list doesn't repaint mid-tap.
+  if (grid_ready && current_screen != SCREEN_WIFI_SCAN && current_screen != SCREEN_WIFI_KEY
+      && millis() - last_footer_tick > 1000) {
     redraw_current_screen();
     last_footer_tick = millis();
   }
@@ -1334,6 +1716,38 @@ void loop() {
         } else if (current_page == 0 && last_x < LEFT_W) {
           // Page 0 GitHub box (anywhere in left column) → full-screen detail.
           goto_github_detail();
+        } else if (current_page == 2) {
+          goto_wifi_scan();
+        }
+      } else if (current_screen == SCREEN_WIFI_SCAN) {
+        const int row_h = 26, start_y = 40;
+        int idx = (last_y - start_y) / row_h;
+        if (!wifi_scan_busy && wifi_list_count > 0
+            && last_y >= start_y && idx >= 0 && idx < wifi_list_count) {
+          goto_wifi_key(wifi_list[idx].ssid);
+        } else if (!wifi_scan_busy) {
+          current_screen = SCREEN_LIST; current_page = 2; redraw_current_screen();
+        }
+      } else if (current_screen == SCREEN_WIFI_KEY) {
+        int k = key_at(last_x, last_y);
+        if      (k == -6) { current_screen = SCREEN_LIST; current_page = 2; redraw_current_screen(); }
+        else if (k == -5) { wifi_try_connect_from_key(); }
+        else if (k == -4) {
+          if (wifi_pass_len < (int)sizeof(wifi_pass_buf) - 1) {
+            wifi_pass_buf[wifi_pass_len++] = ' ';
+            wifi_pass_buf[wifi_pass_len]   = 0;
+            redraw_current_screen();
+          }
+        } else if (k == -3) {
+          if (wifi_pass_len > 0) { wifi_pass_buf[--wifi_pass_len] = 0; redraw_current_screen(); }
+        } else if (k == -2) {
+          wifi_caps_on = !wifi_caps_on; redraw_current_screen();
+        } else if (k > 0) {
+          if (wifi_pass_len < (int)sizeof(wifi_pass_buf) - 1) {
+            wifi_pass_buf[wifi_pass_len++] = (char)k;
+            wifi_pass_buf[wifi_pass_len]   = 0;
+            redraw_current_screen();
+          }
         }
       } else if (current_screen == SCREEN_GITHUB_DETAIL) {
         // Tap in the Issues band opens issues-only page; tap elsewhere goes back.
