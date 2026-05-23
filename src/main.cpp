@@ -50,14 +50,20 @@ static const uint16_t COL_DIM   = RGB565(120,  120, 120);
 static const uint16_t COL_BTC   = RGB565(247,  147, 26);
 static const uint16_t COL_ETH   = RGB565(132,  157, 235);
 static const uint16_t COL_SOL   = RGB565(153,  69,  255);
+static const uint16_t COL_XRP   = RGB565(220,  220, 220);   // light gray
+static const uint16_t COL_BNB   = RGB565(243,  186, 47);    // binance yellow
 
 struct CoinSnapshot {
   float price_usd;
   float change_24h_pct;
   bool  valid;
-  
 };
-static CoinSnapshot btc{}, eth{}, sol{};
+
+static const int COIN_COUNT = 5;
+static const char *COIN_NAMES[COIN_COUNT] = {"BTC", "ETH", "SOL", "XRP", "BNB"};
+static const char *COIN_IDS[COIN_COUNT]   = {"bitcoin", "ethereum", "solana", "ripple", "binancecoin"};
+static const uint16_t COIN_COLORS[COIN_COUNT] = {COL_BTC, COL_ETH, COL_SOL, COL_XRP, COL_BNB};
+static CoinSnapshot coins[COIN_COUNT];
 
 static const uint32_t FETCH_INTERVAL_MS = 30000;
 static const uint32_t RETRY_INTERVAL_MS = 5000;
@@ -81,7 +87,7 @@ struct ChartData {
   int      count;
   uint32_t fetched_at;
 };
-static ChartData charts[3] = {};
+static ChartData charts[COIN_COUNT] = {};
 static const uint32_t CHART_TTL_MS = 5UL * 60UL * 1000UL;
 
 static const char *TZ_BOSNIA = "CET-1CEST,M3.5.0/2,M10.5.0/3";
@@ -93,7 +99,7 @@ static void draw_page_indicator_at(int y_center);
 
 static const char *COINGECKO_URL =
     "https://api.coingecko.com/api/v3/simple/price"
-    "?ids=bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true";
+    "?ids=bitcoin,ethereum,solana,ripple,binancecoin&vs_currencies=eur&include_24hr_change=true";
 
 // --- Touch (AXS15231B integrated touch on I2C 0x3B) ---
 static bool touch_begin() {
@@ -128,19 +134,19 @@ static bool touch_read(int16_t &x, int16_t &y) {
   return true;
 }
 
+// Always 2 decimals; thousands separator only when there are thousands.
+// No currency prefix — the EUR label lives in the page subtitle.
 static void format_money(char *out, size_t cap, float v) {
   unsigned long ip = (unsigned long)v;
   unsigned int  fp = (unsigned int)((v - ip) * 100.0f + 0.5f);
   if (fp == 100) { ip++; fp = 0; }
-  if (v < 100.0f) {
-    snprintf(out, cap, "$%lu.%02u", ip, fp);
-  } else if (v < 10000.0f) {
-    snprintf(out, cap, "$%lu,%03lu.%02u", ip / 1000, ip % 1000, fp);
+  if (v < 1000.0f) {
+    snprintf(out, cap, "%lu.%02u", ip, fp);
   } else if (v < 1000000.0f) {
-    snprintf(out, cap, "$%lu,%03lu", ip / 1000, ip % 1000);
+    snprintf(out, cap, "%lu,%03lu.%02u", ip / 1000, ip % 1000, fp);
   } else {
-    snprintf(out, cap, "$%lu,%03lu,%03lu",
-             ip / 1000000UL, (ip / 1000UL) % 1000UL, ip % 1000UL);
+    snprintf(out, cap, "%lu,%03lu,%03lu.%02u",
+             ip / 1000000UL, (ip / 1000UL) % 1000UL, ip % 1000UL, fp);
   }
 }
 
@@ -152,6 +158,18 @@ static int16_t text_width(const char *s, uint8_t size) {
   return (int16_t)(strlen(s) * 6 * size);
 }
 
+static int draw_euro(int x, int y, uint8_t size, uint16_t color) {
+  gfx->setTextSize(size);
+  gfx->setTextColor(color);
+  gfx->setCursor(x, y);
+  gfx->print("C");
+  int bar_w = 5 * size;
+  int bar_h = size >= 2 ? size / 2 : 1;
+  gfx->fillRect(x - size / 2, y + 2 * size, bar_w, bar_h, color);
+  gfx->fillRect(x - size / 2, y + 4 * size, bar_w, bar_h, color);
+  return 6 * size + 2;
+}
+
 // --- Layout (480x320 landscape, split screen) ---
 static const int16_t MARGIN     = 16;
 static const int16_t ROW_HEIGHT = 70;
@@ -159,9 +177,9 @@ static const int16_t BTC_Y      = 60;
 static const int16_t ETH_Y      = 140;
 static const int16_t SOL_Y      = 220;
 static const int16_t FOOTER_Y   = 300;
-static const int16_t LEFT_W     = 260;   // crypto column width — tightened to give right column more room
-static const int16_t DIVIDER_X  = 260;
-static const int16_t RIGHT_W    = LCD_W - DIVIDER_X;  // 220 px wide
+static const int16_t LEFT_W     = 320;   // GitHub gets more room; right widget stub narrows.
+static const int16_t DIVIDER_X  = 320;
+static const int16_t RIGHT_W    = LCD_W - DIVIDER_X;  // 160 px wide
 static const int16_t CLAUDE_Y   = 140;   // start of Claude box in right column
 
 // --- Weather (Open-Meteo for Graz, Austria — no API key required) ---
@@ -242,37 +260,46 @@ static void status_line(int y, uint16_t color, const char *text) {
   gfx->flush();
 }
 
+// Single-line coin row: ticker on the left, then price (white) + 24h % (green/red)
+// on the right, all on one baseline so the row only needs ~24 px of height.
 static void draw_coin_row(int16_t y, const char *ticker, uint16_t ticker_color,
                           const CoinSnapshot &c) {
   gfx->setTextSize(3);
   gfx->setTextColor(ticker_color);
-  gfx->setCursor(MARGIN, y + 10);
+  gfx->setCursor(MARGIN, y);
   gfx->print(ticker);
 
   if (!c.valid) {
     gfx->setTextSize(2);
     gfx->setTextColor(COL_DIM);
     const char *msg = "no data";
-    gfx->setCursor(LEFT_W - MARGIN - text_width(msg, 2), y + 18);
+    gfx->setCursor(LCD_W - MARGIN - text_width(msg, 2), y + 4);
     gfx->print(msg);
     return;
   }
 
-  char price_buf[24];
+  char price_buf[24], pct_buf[16];
   format_money(price_buf, sizeof(price_buf), c.price_usd);
-  gfx->setTextSize(3);
-  gfx->setTextColor(COL_TITLE);
-  int16_t price_w = text_width(price_buf, 3);
-  gfx->setCursor(LEFT_W - MARGIN - price_w, y + 10);
-  gfx->print(price_buf);
-
-  char pct_buf[16];
   format_pct(pct_buf, sizeof(pct_buf), c.change_24h_pct);
+
+  int euro_w  = 6 * 3 + 2;                      // width that draw_euro reserves at size 3
+  int price_w = text_width(price_buf, 3);
+  int pct_w   = text_width(pct_buf, 2);
+  const int gap = 14;
+  int x_right = LCD_W - MARGIN;
+
   gfx->setTextSize(2);
   gfx->setTextColor(c.change_24h_pct >= 0 ? COL_OK : COL_ERR);
-  int16_t pct_w = text_width(pct_buf, 2);
-  gfx->setCursor(LEFT_W - MARGIN - pct_w, y + 44);
+  gfx->setCursor(x_right - pct_w, y + 4);
   gfx->print(pct_buf);
+
+  int price_x = x_right - pct_w - gap - price_w;
+  gfx->setTextSize(3);
+  gfx->setTextColor(COL_TITLE);
+  gfx->setCursor(price_x, y);
+  gfx->print(price_buf);
+
+  draw_euro(price_x - euro_w, y, 3, COL_TITLE);
 }
 
 static void draw_right_column() {
@@ -304,15 +331,26 @@ static void draw_right_column() {
     gfx->print("syncing...");
   }
 
-  // Temperature
+  // Temperature with a tiny circle for the degree sign (default font has no °).
   if (weather_code >= 0) {
-    char temp_buf[16];
-    snprintf(temp_buf, sizeof(temp_buf), "%dC", (int)(weather_temp_c + (weather_temp_c >= 0 ? 0.5f : -0.5f)));
-    gfx->setTextSize(3);
+    int temp = (int)(weather_temp_c + (weather_temp_c >= 0 ? 0.5f : -0.5f));
+    char num_buf[8];
+    snprintf(num_buf, sizeof(num_buf), "%d", temp);
+    const int t_size  = 3;
+    const int circle_r = 3;
+    const int pad      = 2;
+    int num_w   = text_width(num_buf, t_size);
+    int c_w     = 6 * t_size;            // width of the 'C' glyph at this size
+    int total_w = num_w + 2 * circle_r + pad + c_w;
+    int sx      = rcenter - total_w / 2;
+
+    gfx->setTextSize(t_size);
     gfx->setTextColor(COL_WARN);
-    int16_t w = text_width(temp_buf, 3);
-    gfx->setCursor(rcenter - w / 2, 75);
-    gfx->print(temp_buf);
+    gfx->setCursor(sx, 75);
+    gfx->print(num_buf);
+    gfx->drawCircle(sx + num_w + circle_r, 75 + circle_r + 1, circle_r, COL_WARN);
+    gfx->setCursor(sx + num_w + 2 * circle_r + pad, 75);
+    gfx->print("C");
 
     const char *wlabel = weather_label(weather_code);
     gfx->setTextSize(1);
@@ -432,30 +470,61 @@ static void draw_footer_into_canvas() {
   gfx->print(left);
 }
 
-static void draw_grid() {
+// Page 2: full-screen 5-coin grid (BTC, ETH, SOL, XRP, BNB). Single-line rows
+// (ticker + price + %) so all five fit between header and footer.
+static const int CRYPTO_ROW_H = 44;
+static const int CRYPTO_ROW0  = 56;
+
+static void draw_page_crypto() {
   gfx->fillScreen(COL_BG);
-  draw_header_into_canvas();
-  draw_coin_row(BTC_Y, "BTC", COL_BTC, btc);
-  draw_coin_row(ETH_Y, "ETH", COL_ETH, eth);
-  draw_coin_row(SOL_Y, "SOL", COL_SOL, sol);
-  draw_footer_into_canvas();
-  draw_right_column();
-  draw_page_indicator_at(FOOTER_Y + 12);
+
+  gfx->setTextSize(3);
+  gfx->setTextColor(COL_TITLE);
+  const char *t = "CoinDeck";
+  gfx->setCursor((LCD_W - text_width(t, 3)) / 2, 6);
+  gfx->print(t);
+  gfx->setTextSize(1);
+  gfx->setTextColor(COL_DIM);
+  const char *sub = "prices in EUR";
+  gfx->setCursor((LCD_W - text_width(sub, 1)) / 2, 36);
+  gfx->print(sub);
+
+  for (int i = 0; i < COIN_COUNT; i++) {
+    draw_coin_row(CRYPTO_ROW0 + i * CRYPTO_ROW_H,
+                  COIN_NAMES[i], COIN_COLORS[i], coins[i]);
+  }
+
+  // Footer: "updated Xs ago" left, "HH:MM" right
+  gfx->setTextSize(1);
+  gfx->setTextColor(COL_DIM);
+  char left[40];
+  if (last_fetch_ok == 0) snprintf(left, sizeof(left), "fetching...");
+  else snprintf(left, sizeof(left), "updated %lus ago",
+                (unsigned long)((millis() - last_fetch_ok) / 1000));
+  gfx->setCursor(MARGIN, LCD_H - 12);
+  gfx->print(left);
+  char clock_buf[8];
+  if (format_time(clock_buf, sizeof(clock_buf))) {
+    gfx->setCursor(LCD_W - MARGIN - text_width(clock_buf, 1), LCD_H - 12);
+    gfx->print(clock_buf);
+  }
+
+  draw_page_indicator_at(LCD_H - 12);
   gfx->flush();
   grid_ready = true;
 }
 
 static const char *coin_name(int idx) {
-  switch (idx) { case 0: return "BTC"; case 1: return "ETH"; case 2: return "SOL"; }
+  if (idx >= 0 && idx < COIN_COUNT) return COIN_NAMES[idx];
   return "?";
 }
 static uint16_t coin_color(int idx) {
-  switch (idx) { case 0: return COL_BTC; case 1: return COL_ETH; case 2: return COL_SOL; }
+  if (idx >= 0 && idx < COIN_COUNT) return COIN_COLORS[idx];
   return COL_DIM;
 }
 static const CoinSnapshot &coin_snap(int idx) {
-  switch (idx) { case 0: return btc; case 1: return eth; }
-  return sol;
+  if (idx >= 0 && idx < COIN_COUNT) return coins[idx];
+  return coins[0];
 }
 
 // --- Chart fetch + draw ---
@@ -465,15 +534,13 @@ static const int CHART_Y0 = 220;
 static const int CHART_Y1 = 285;
 
 static bool fetch_chart(int coin_idx) {
-  if (coin_idx < 0 || coin_idx > 2) return false;
+  if (coin_idx < 0 || coin_idx >= COIN_COUNT) return false;
   if (WiFi.status() != WL_CONNECTED) return false;
-  const char *id = coin_idx == 0 ? "bitcoin"
-                 : coin_idx == 1 ? "ethereum"
-                 :                  "solana";
+  const char *id = COIN_IDS[coin_idx];
   char url[160];
   snprintf(url, sizeof(url),
            "https://api.coingecko.com/api/v3/coins/%s/market_chart"
-           "?vs_currency=usd&days=1", id);
+           "?vs_currency=eur&days=1", id);
 
   WiFiClientSecure client; client.setInsecure();
   HTTPClient http;
@@ -576,9 +643,13 @@ static void draw_detail() {
   } else {
     char price_buf[24];
     format_money(price_buf, sizeof(price_buf), c.price_usd);
+    int euro_w = 6 * 4 + 2;
+    int total  = euro_w + text_width(price_buf, 4);
+    int px     = (LCD_W - total) / 2;
+    draw_euro(px, 90, 4, COL_TITLE);
     gfx->setTextSize(4);
     gfx->setTextColor(COL_TITLE);
-    gfx->setCursor((LCD_W - text_width(price_buf, 4)) / 2, 90);
+    gfx->setCursor(px + euro_w, 90);
     gfx->print(price_buf);
 
     char pct_buf[16];
@@ -645,15 +716,12 @@ static void draw_page2() {
   uint16_t dot_color = !has_data ? COL_DIM : live ? COL_OK : COL_WARN;
   gfx->fillCircle(LEFT_W / 2 + text_width(t, 2) / 2 + 10, 20, 3, dot_color);
 
-  // Right-column placeholder
-  gfx->setTextSize(1);
-  gfx->setTextColor(COL_DIM);
-  const char *rhint = "more widgets here";
-  int rcx = DIVIDER_X + RIGHT_W / 2;
-  gfx->setCursor(rcx - text_width(rhint, 1) / 2, LCD_H / 2 - 4);
-  gfx->print(rhint);
+  // Right column = the weather/clock/Claude widgets that used to live on Page 1.
+  draw_right_column();
 
   if (!has_data) {
+    gfx->setTextSize(1);
+    gfx->setTextColor(COL_DIM);
     const char *m = "waiting for daemon...";
     gfx->setCursor((LEFT_W - text_width(m, 1)) / 2, LCD_H / 2 - 4);
     gfx->print(m);
@@ -685,24 +753,25 @@ static void draw_page2() {
       return y + 20;
     }
 
-    const int row_h = 20;
+    // setTextSize(1, 2) = same 6-px width as size 1 but 16-px tall — a "1.5x" feel.
+    const int row_h = 18;
     int rows = list_count < max_rows ? list_count : max_rows;
     for (int i = 0; i < rows; i++) {
       char numbuf[8];
       snprintf(numbuf, sizeof(numbuf), "#%d", list[i].num);
-      int num_w = text_width(numbuf, 2);
-      gfx->setTextSize(2);
+      int num_w = text_width(numbuf, 1);
+      gfx->setTextSize(1, 2);
       gfx->setTextColor(COL_DIM);
       gfx->setCursor(12, y + i * row_h);
       gfx->print(numbuf);
 
       const char *cleaned = strip_cc_prefix(list[i].title);
-      int avail     = LEFT_W - 24 - num_w - 6;  // remaining px
-      int max_chars = avail / 12;                // size 2 ≈ 12 px / char
+      int avail     = LEFT_W - 24 - num_w - 6;
+      int max_chars = avail / 6;
       if (max_chars < 1) max_chars = 1;
-      char title[40];
+      char title[64];
       if ((int)strlen(cleaned) > max_chars) {
-        int keep = max_chars - 1;  // last char becomes '~' as truncation hint
+        int keep = max_chars - 1;
         if (keep < 1) keep = 1;
         strncpy(title, cleaned, keep);
         title[keep] = '~';
@@ -752,8 +821,8 @@ static void draw_page2() {
 
 static void redraw_current_screen() {
   if (current_screen == SCREEN_DETAIL) { draw_detail(); return; }
-  if (current_page == 0) draw_grid();
-  else                   draw_page2();
+  if (current_page == 0) draw_page2();        // GitHub on page 0
+  else                   draw_page_crypto();  // CoinDeck full-screen on page 1
 }
 
 static void goto_list() {
@@ -762,7 +831,7 @@ static void goto_list() {
 }
 
 static void goto_detail(int coin_idx) {
-  current_coin = (coin_idx + 3) % 3;
+  current_coin = (coin_idx + COIN_COUNT) % COIN_COUNT;
   current_screen = SCREEN_DETAIL;
   redraw_current_screen();
 }
@@ -869,14 +938,20 @@ static bool fetch_prices() {
     return false;
   }
 
-  btc = { doc["bitcoin"]["usd"]  | 0.0f, doc["bitcoin"]["usd_24h_change"]  | 0.0f, true };
-  eth = { doc["ethereum"]["usd"] | 0.0f, doc["ethereum"]["usd_24h_change"] | 0.0f, true };
-  sol = { doc["solana"]["usd"]   | 0.0f, doc["solana"]["usd_24h_change"]   | 0.0f, true };
-
-  Serial.printf("BTC $%-10.2f %+6.2f%%   ETH $%-8.2f %+6.2f%%   SOL $%-6.2f %+6.2f%%\n",
-                btc.price_usd, btc.change_24h_pct,
-                eth.price_usd, eth.change_24h_pct,
-                sol.price_usd, sol.change_24h_pct);
+  for (int i = 0; i < COIN_COUNT; i++) {
+    coins[i] = {
+      doc[COIN_IDS[i]]["eur"]            | 0.0f,
+      doc[COIN_IDS[i]]["eur_24h_change"] | 0.0f,
+      true
+    };
+  }
+  Serial.printf("BTC EUR %.2f %+6.2f%% | ETH EUR %.2f %+6.2f%% | SOL EUR %.2f %+6.2f%% | "
+                "XRP EUR %.4f %+6.2f%% | BNB EUR %.2f %+6.2f%%\n",
+                coins[0].price_usd, coins[0].change_24h_pct,
+                coins[1].price_usd, coins[1].change_24h_pct,
+                coins[2].price_usd, coins[2].change_24h_pct,
+                coins[3].price_usd, coins[3].change_24h_pct,
+                coins[4].price_usd, coins[4].change_24h_pct);
   return true;
 }
 
@@ -963,7 +1038,7 @@ void setup() {
                   gh_open_prs, gh_pr_count, gh_review_requested, gh_review_count,
                   gh_ci_passed, gh_ci_failed, gh_ci_pending);
     http_server.send(200, "application/json", "{\"ok\":true}");
-    if (current_screen == SCREEN_LIST && current_page == 1) redraw_current_screen();
+    if (current_screen == SCREEN_LIST && current_page == 0) redraw_current_screen();
   });
   http_server.on("/", HTTP_GET, []() {
     http_server.send(200, "text/plain",
@@ -1059,12 +1134,15 @@ void loop() {
     } else {
       Serial.printf("TAP x=%d y=%d\n", last_x, last_y);
       if (current_screen == SCREEN_LIST) {
-        if (current_page == 0 && last_x < LEFT_W) {
-          int picked = -1;
-          if      (last_y >= BTC_Y && last_y < BTC_Y + ROW_HEIGHT) picked = 0;
-          else if (last_y >= ETH_Y && last_y < ETH_Y + ROW_HEIGHT) picked = 1;
-          else if (last_y >= SOL_Y && last_y < SOL_Y + ROW_HEIGHT) picked = 2;
-          if (picked >= 0) goto_detail(picked);
+        // Crypto rows live on page 1 now; tap them to open detail view.
+        if (current_page == 1) {
+          for (int i = 0; i < COIN_COUNT; i++) {
+            int top = CRYPTO_ROW0 + i * CRYPTO_ROW_H;
+            if (last_y >= top && last_y < top + CRYPTO_ROW_H) {
+              goto_detail(i);
+              break;
+            }
+          }
         }
       } else {
         goto_list();
